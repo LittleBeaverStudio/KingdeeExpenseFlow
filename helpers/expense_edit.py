@@ -271,6 +271,12 @@ def main():
     s = sub.add_parser("check", help="综合体检")
     s.add_argument("fid")
 
+    # 让 --travel 写在子命令「前」或「后」都能生效
+    # （default=SUPPRESS：子命令未显式给出时不覆盖顶层已解析的值）
+    for _sp in sub.choices.values():
+        _sp.add_argument("--travel", action="store_true", default=argparse.SUPPRESS,
+                         help="操作差旅费报销单（写在子命令前后均可）")
+
     a = ap.parse_args()
     kd = Kingdee(load_kingdee_config())
     formid = pick_form(a.travel)

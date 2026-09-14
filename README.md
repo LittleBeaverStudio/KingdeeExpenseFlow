@@ -157,7 +157,7 @@ python helpers/expense_edit.py attach <报销单FID> <文件路径>
 python helpers/expense_edit.py download <FileId> [--out 本地路径]
 python helpers/expense_edit.py check <报销单FID>
 
-# 差旅费报销单：以上命令都加 --travel
+# 差旅费报销单：以上命令都加 --travel（写在子命令前或后均可，如 `--travel attach ...`）
 ```
 
 ## 🤖 让 AI 工具识别这个 Skill
