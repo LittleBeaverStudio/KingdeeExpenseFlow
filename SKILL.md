@@ -13,8 +13,8 @@ description: 金蝶云星空「费用/差旅报销全流程」提交 Skill。指
 |---|---|---|---|
 | 费用申请单 | `ER_ExpenseRequest` | → 费用报销单 `ER_ExpReimbursement` | ✅ 已跑通 |
 | 费用报销单 | `ER_ExpReimbursement` | （终态，提交审批后付款） | ✅ 已跑通 |
-| 出差申请单 | `ER_ExpenseRequest_Travel` | → 差旅费报销单 `ER_ExpReimbursement_Travel` | 🟡 申请单已实测；下推/报销待实测 |
-| 差旅费报销单 | `ER_ExpReimbursement_Travel` | （终态） | 🟡 实体结构与费用单**完全同构**，收票/联动写法通用；整链待实跑 |
+| 出差申请单 | `ER_ExpenseRequest_Travel` | → 差旅费报销单 `ER_ExpReimbursement_Travel` | ✅ 创建→提交→审核 已跑通 |
+| 差旅费报销单 | `ER_ExpReimbursement_Travel` | （终态，提交审批后付款） | 🟡 实体结构与费用单**完全同构**；下推→挂票→改明细→写联动→传附件→体检**全通过**，仅 Submit 待实跑 |
 
 > ⚠️ formid 拼写极敏感：`ER_ExpReimbursement`（正确，无多余 s）vs `ER_ExpenseReimbursement`（错误，曾因此误判"单据不存在"）。ExecuteBillQuery 查不到某单据时，先怀疑 formid 拼错或账号无该表单权限，不要直接认定"没部署"。
 
