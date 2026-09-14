@@ -60,8 +60,8 @@ python recvin_link.py link 101717 SPD00008518
 #    覆盖模式（清掉未列出的行，用于纠错）
 python recvin_link.py link 101717 SPD00008518,SPD00008631 --replace
 
-#    差旅费报销单
-python recvin_link.py link 101717 SPD00008518 --travel
+#    差旅费报销单（--travel 放子命令前或后都可以）
+python recvin_link.py --travel link 101717 SPD00008518
 
 #    连发票云流水号一起写（可选；官方流程留空，一般不需要）
 python recvin_link.py link 101717 SPD00008518 --with-serial
@@ -605,6 +605,12 @@ def main():
     s.add_argument("--with-serial", action="store_true")
     s.add_argument("--allow-steal", action="store_true")
     s.set_defaults(fn=cmd_verify)
+
+    # 让 --travel 写在子命令「前」或「后」都能生效
+    # （default=SUPPRESS：子命令未显式给出时不覆盖顶层已解析的值）
+    for _sp in sub.choices.values():
+        _sp.add_argument("--travel", action="store_true", default=argparse.SUPPRESS,
+                         help="操作差旅费报销单（写在子命令前后均可）")
 
     a = p.parse_args()
     if getattr(a, "nos", None) and isinstance(a.nos, str):

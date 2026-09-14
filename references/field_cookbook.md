@@ -168,7 +168,7 @@ python helpers/recvin_link.py link 101717 SPD00008518        # 挂上去（追�
 python helpers/recvin_link.py link 101717 SPD00008518 --replace   # 覆盖式写入
 python helpers/recvin_link.py clear 101717                        # 清空全部
 python helpers/recvin_link.py verify 101717 SPD00008518      # 定位→写→回读→联动校验
-python helpers/recvin_link.py link 101717 SPD00008518 --travel     # 差旅费报销单
+python helpers/recvin_link.py --travel link 101717 SPD00008518     # 差旅费报销单
 ```
 
 **核心写法（必须严格遵守层级）**：
