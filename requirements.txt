@@ -1,0 +1,5 @@
+# 本 Skill 的核心链路（收票信息写入、明细对齐、附件上传、提交）
+# 只用 Python 标准库，无需安装任何第三方包。
+#
+# 请确保 Python 版本 >= 3.8。
+requests>=2.31.0   # 仅当你想用 kingdee-data-exporter / analyzer 同款调用方式时需要

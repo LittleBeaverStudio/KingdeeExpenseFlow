@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.history/
+
+# 本地凭证（务必不要提交）
+config.py
+piazzone_config.py
+piazzone_companies.json
+
+# 单据与发票原件（含个人与企业信息，禁止提交）
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.zip
+*.xlsx
+*.csv
+*.json
+
+# 内部工作稿
+复盘-*.md
+项目状态-*.md
+边界测试报告-*.html
+_*.py

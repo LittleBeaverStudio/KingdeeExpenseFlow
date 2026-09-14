@@ -1,0 +1,4 @@
+interface:
+  display_name: "金蝶云星空报销流程"
+  short_description: "帮员工在对话框里完成金蝶费用/差旅报销：挂发票到收票信息、对齐明细、上传行程单、提交审批"
+  default_prompt: "使用 $kingdee-expense-flow 帮我把这张发票提交成费用报销单，员工不登录金蝶。"
