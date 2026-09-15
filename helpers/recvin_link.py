@@ -742,9 +742,9 @@ def main():
     s.add_argument("--allow-steal", action="store_true",
                    help="允许把已被其它单据关联的收票单抢过来（默认禁止）")
     s.add_argument("--allow-cross-org", action="store_true",
-                   help="允许跨组织挂票（默认拦截：会写成单据但审核必被驳回为 D）")
+                   help="允许跨组织挂票（默认拦截：能写进去，但界面取不到发票云流水号、单据会变 D）")
     s.add_argument("--allow-no-piaozone", action="store_true",
-                   help="允许挂没有发票云流水号的收票单（默认拦截：界面打开会报错）")
+                   help="允许挂没有发票云流水号的收票单（默认拦截：界面打开/补发票会报错）")
     s.set_defaults(fn=cmd_link)
 
     s = sub.add_parser("clear", help="清空报销单全部收票信息行")
