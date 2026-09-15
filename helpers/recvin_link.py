@@ -19,8 +19,30 @@
        ResolveFiled_InnerEx解析字段(Key:FIVSerialNo…)…实体不存在此属性！[EntityType：BillHead…]
   2. **死磕 FIVSerialNo**：官方流程产物的 FIVSERIALNO 是空的（实测 101714/101716 均为 " "）。
      真正承载关联的是 `FRecInv`（收票单）。FIVSerialNo 是可选装饰，不是入口。
+     ⚠️ **但这条只在「同组织」成立**（101714/101716 都是本组织的票）：
+     跨组织时，界面要拿**报销单组织的税号**去发票云解析这张票，
+     而票是别人的 → 取不到发票云流水号 → 报「驳回：无法获取当前关联收票单的
+     发票云发票流水号」→ 单据变 `D`。详见 `guard_recv_invoices()`。
   3. **误读元数据锁**：FRecInv 的 IsNewLock/IsEditLock 均为 True，据此判定"必然写不进"。
      实测**该锁定不阻止 WebAPI Save 写入分录字段**。不要只凭 IsNewLock 下结论，要实测。
+
+════════════════════════════════════════════════════════════════════════
+🔴 边界：能写进去 ≠ 单据可用（2026-09-15 实测，务必先读）
+════════════════════════════════════════════════════════════════════════
+本脚本走的是「**直接 Save 报销单的 FRecInvInfo 子表**」这一条路。
+金蝶 WebAPI 的 18 个 Operation 里**没有**「选择发票 / 补发票」——
+发票云取票 + 回写流水号是**纯 UI 交互**，WebAPI 没开放。
+所以直接写子表 = **跳过了发票云的取票与组织归属校验**，校验被推迟到界面/审核环节：
+
+  Save ✅ → Submit ✅（当场读到 B）→ **界面打开/审核 ❌ → 单据变 D（重新审核＝驳回）**
+
+硬约束（`guard_recv_invoices()` 会在写入前拦住）：
+  · 收票单 `SOURCEORGID`（购方/来源组织）**必须 = 报销单组织**。挂票只改写 `SETTLEORGID`，
+    **改不掉"这张票是别人的"**（`PURNAME` 仍是原购方）→ 跨组织必然被驳回。
+  · 收票单要是**发票云归集**来的：`FPDFURL` / `FPIAOZONESERIALNUMBER` 非空。
+  · 目标组织**收票服务许可**须在有效期内（实测示例二科技 105 已过期，
+    发票云报「…【收票服务】许可已过期失效…[0300]」）。
+  需绕过时用 `--allow-cross-org` / `--allow-no-piaozone` 显式声明（默认全拦）。
 
 ════════════════════════════════════════════════════════════════════════
 已验证事实（示例科技生产环境，2026-09-14）
@@ -30,7 +52,8 @@
               LINKIVNUMBER=FYBX20260101000002, LINKBILLDATE=2026-09-14 ✅
 · 与官方流程产物对比（101716 ← 118632/118633）逐字段一致 ✅
 · 费用明细 FEntity(=ER_ExpenseReimbEntry) 未被 IsDeleteEntry=true 误删 ✅
-· 只需收票单号即可，FIVSerialNo 可不写（官方也不写）✅
+· 只需收票单号即可，FIVSerialNo 可不写（官方也不写）✅ —— **仅限同组织**（见上「边界」）
+· ⚠️ 反面实测（2026-09-15）：跨组织挂票 Save/Submit 均成功，但单据全部被驳回为 `D`。
 
 ════════════════════════════════════════════════════════════════════════
 实体名映射（View 用 EntryName，Save 用 Key —— 一直是踩坑点）
@@ -251,11 +274,13 @@ class Kingdee:
     # 名字写错会直接报「元数据中标识为 XXX 的字段不存在」。以下是逐字段实测通过的清单。
     # 另注：返回的列顺序 = FieldKeys 顺序（实测 A/B/C 三种排列均对应），可安全按位置解析。
     RECV_FIELDS = ("FID,FBillNo,FIVNUMBER,FSUMALLAMOUNT,FOPENDATE,FSALENAME,FPURNAME,"
-                   "FLINKBILLTYPE,FLINKBILLID,FLINKIVNUMBER,FPDFURL,FPIAOZONESERIALNUMBER")
+                   "FLINKBILLTYPE,FLINKBILLID,FLINKIVNUMBER,FPDFURL,FPIAOZONESERIALNUMBER,"
+                   "FSOURCEORGID.FNumber,FSOURCEORGID.FName,FSETTLEORGID.FNumber")
 
     def find_received_invoice(self, invoice_no=None, recv_bill_no=None, top=20):
         """按发票号码或收票单号查收票单。返回 [{fid, bill_no, invoice_no, amount, open_date,
-        seller, buyer, link_bill_type, link_bill_id, link_iv, pdf_url, serial}]"""
+        seller, buyer, link_bill_type, link_bill_id, link_iv, pdf_url, serial,
+        src_org_no, src_org_name, settle_org_no}]"""
         conds = []
         if invoice_no:
             conds.append(f"FIVNUMBER='{invoice_no}'")
@@ -266,13 +291,14 @@ class Kingdee:
         rows = self.query(FORM_RECV_INV, self.RECV_FIELDS, " and ".join(conds), top)
         out = []
         for r in rows:
-            if len(r) < 12:
+            if len(r) < 15:
                 print(f"  [!] 查询返回列数异常（{len(r)}），跳过：{r}")
                 continue
             out.append({"fid": r[0], "bill_no": r[1], "invoice_no": r[2], "amount": r[3],
                         "open_date": r[4], "seller": r[5], "buyer": r[6],
                         "link_bill_type": r[7], "link_bill_id": r[8], "link_iv": r[9],
-                        "pdf_url": r[10], "serial": r[11]})
+                        "pdf_url": r[10], "serial": r[11],
+                        "src_org_no": r[12], "src_org_name": r[13], "settle_org_no": r[14]})
         return out
 
     # ── 报销单收票信息 ──
@@ -282,8 +308,79 @@ class Kingdee:
         rows = o.get(RECV_ENTITY["view_name"]) or []
         return rows if isinstance(rows, list) else []
 
+    def bill_org_no(self, bill_fid, formid=FORM_EXPENSE):
+        """读报销单的组织编号（如 '104'）+ 组织名。返回 (编号, 名称, 单据View)。
+
+        ⚠️ View 里 `OrgID` 是 dict，但 `OrgID.Name` 是**多语言列表**
+        `[{'Key':2052,'Value':'…'}]`（`Number` 仍是字符串），直接打印会看到一坨 list。
+        """
+        o = self.view(formid, bill_fid)
+        org = o.get("OrgID") or {}
+
+        def _flat(v):
+            if isinstance(v, list):
+                if not v:
+                    return ""
+                for x in v:
+                    if isinstance(x, dict) and x.get("Key") == 2052:
+                        return str(x.get("Value") or "")
+                first = v[0]
+                return str(first.get("Value") if isinstance(first, dict) else first)
+            if isinstance(v, dict):
+                return str(v.get("Value") or v.get("Name") or "")
+            return str(v or "")
+
+        if isinstance(org, list):
+            org = org[0] if org else {}
+        return _flat(org.get("Number")), _flat(org.get("Name")), o
+
+    def guard_recv_invoices(self, bill_fid, nos, formid=FORM_EXPENSE,
+                            allow_cross_org=False, allow_no_piaozone=False):
+        """挂票**前置体检**（2026-09-15 新增，血泪教训）。
+
+        返回 (blocks, warns, rows)：blocks 非空就不该写。
+
+        ── 为什么必须查这个 ──────────────────────────────────────────
+        2026-09-15 实测：把示例科技的收票单挂到 101720(org104)/101721(org105)，
+        `Save` 成功、`Submit` 成功（当场读到 B），**但两张单随后都变成 `D`
+        （重新审核＝审核驳回）**，界面上点「查看发票」直接报：
+
+            驳回：无法获取当前关联收票单的发票云发票流水号，请尝试删除收票单后重做收票
+
+        根因不是"字段写错了"，而是 **发票云是按「组织税号 + 收票服务许可」授权的**：
+        · 收票单 `SOURCEORGID`（购方/来源组织）**必须等于报销单组织** ——
+          跨组织挂票只改写 `SETTLEORGID`，改不掉"这张票是别人的"这个事实；
+          UI 拿本组织税号去发票云查别人的票 → 查不到 → 驳回。
+        · 收票单还得是**发票云归集**来的（`FPDFURL` / `FPIAOZONESERIALNUMBER` 非空）；
+          手工建的、没有云流水的收票单，即使同组织也会报同一个错。
+        · 目标组织还必须**收票服务许可在有效期内**（示例二科技 105 实测已过期；
+          发票云报 `当前使用税号【…】【收票服务】许可已过期失效…[0300]`）。
+        ────────────────────────────────────────────────────────────
+        """
+        org_no, org_name, _ = self.bill_org_no(bill_fid, formid)
+        hits, blocks, warns = [], [], []
+        for no in nos:
+            found = self.find_received_invoice(recv_bill_no=no)
+            if not found:
+                blocks.append(f"{no} 收票单不存在")
+                continue
+            h = found[0]
+            hits.append(h)
+            if str(h["src_org_no"] or "") != org_no:
+                msg = (f"{no} 属于组织 {h['src_org_no']}（购方 {h['buyer']}），"
+                       f"而报销单组织是 {org_no}（{org_name}）→ 跨组织，"
+                       f"提交后会被驳回为 D")
+                (blocks if not allow_cross_org else warns).append(msg)
+            if not (h["pdf_url"] or "").strip() and not (h["serial"] or "").strip():
+                msg = (f"{no} 没有发票云流水号（FPDFURL / FPIAOZONESERIALNUMBER 均为空）"
+                       f"→ 不是发票云归集的收票单，界面打开会报"
+                       f"「无法获取…发票云发票流水号」")
+                (blocks if not allow_no_piaozone else warns).append(msg)
+        return blocks, warns, hits
+
     def link(self, bill_fid, recv_bill_nos, formid=FORM_EXPENSE, replace=False,
-             with_serial=False, skip_existing=True, allow_steal=False):
+             with_serial=False, skip_existing=True, allow_steal=False,
+             allow_cross_org=False, allow_no_piaozone=False):
         """把收票单挂到报销单「收票信息」。
 
         recv_bill_nos : 收票单号列表（如 ['SPD00008518']）
@@ -332,6 +429,21 @@ class Kingdee:
                     + "\n     ".join(conflicts)
                     + "\n   如确需改挂，请加 --allow-steal；若只是想把它们还给原单，"
                       "用 link <原单FID> <这些收票单号> --replace。")
+
+        # ── 前置体检：跨组织 / 非发票云票，一律先拦下（2026-09-15 新增） ──
+        if todo:
+            blocks, warns, _ = self.guard_recv_invoices(
+                bill_fid, todo, formid,
+                allow_cross_org=allow_cross_org, allow_no_piaozone=allow_no_piaozone)
+            for w in warns:
+                print(f"  ⚠️ {w}")
+            if blocks:
+                raise SystemExit(
+                    "❌ 挂票前置体检不通过（写进去 Save/Submit 都会成功，但单据在界面里不可用、"
+                    "审核会被驳回）：\n     "
+                    + "\n     ".join(blocks)
+                    + "\n   如你已明确知道后果仍要继续，加 --allow-cross-org / "
+                      "--allow-no-piaozone（两者可同时用）。")
 
         serial_of = {}
         if with_serial:
@@ -425,6 +537,15 @@ class Kingdee:
             blocks.append(f"发票价税合计 {inv_amt} < 报销金额 {reimb_amt}")
         if not cu.get("Id"):
             warns.append("往来单位(FCONTACTUNIT)为空 —— 实测不影响 Submit，但单据不完整，建议补")
+
+        # ── 收票单组织归属 / 发票云流水号（2026-09-15 新增）──
+        # 这两条是"提交成功但界面报错、审核被驳回为 D"的真正成因，必须前置暴露。
+        recv_nos = [(r.get("RecInv") or {}).get("FBillNo") for r in rows]
+        recv_nos = [n for n in recv_nos if n]
+        if recv_nos:
+            g_blocks, g_warns, _ = self.guard_recv_invoices(bill_fid, recv_nos, formid)
+            blocks.extend(g_blocks)
+            warns.extend(g_warns)
         return {"status": status, "bill_no": o.get("BillNo"), "contact_unit": cu,
                 "reimb_amt": reimb_amt, "recv_rows": rows, "inv_amt": inv_amt,
                 "blocks": blocks, "warns": warns}
@@ -477,7 +598,9 @@ def cmd_link(kd, a):
     print(f"→ 报销单 {a.fid}（{formid}）"
           f"{'覆盖' if a.replace else '追加'}写入收票单 {a.nos}")
     res = kd.link(a.fid, a.nos, formid=formid, replace=a.replace,
-                  with_serial=a.with_serial, allow_steal=a.allow_steal)
+                  with_serial=a.with_serial, allow_steal=a.allow_steal,
+                  allow_cross_org=a.allow_cross_org,
+                  allow_no_piaozone=a.allow_no_piaozone)
     print(f"  ✅ 写入 {len(res['written'])} 行：{res['written']}")
     time.sleep(1)
     print("\n  回读校验：")
@@ -564,7 +687,9 @@ def cmd_verify(kd, a):
             print("   ", _fmt_inv(h))
     print("\n② 写入收票信息")
     res = kd.link(a.fid, a.nos, formid=formid, replace=a.replace,
-                  with_serial=a.with_serial, allow_steal=a.allow_steal)
+                  with_serial=a.with_serial, allow_steal=a.allow_steal,
+                  allow_cross_org=a.allow_cross_org,
+                  allow_no_piaozone=a.allow_no_piaozone)
     print(f"   ✅ {res['written']}")
     time.sleep(2)
     print("\n③ 回读报销单")
@@ -607,6 +732,10 @@ def main():
     s.add_argument("--with-serial", action="store_true", help="同时写发票云流水号 FIVSerialNo")
     s.add_argument("--allow-steal", action="store_true",
                    help="允许把已被其它单据关联的收票单抢过来（默认禁止）")
+    s.add_argument("--allow-cross-org", action="store_true",
+                   help="允许跨组织挂票（默认拦截：会写成单据但审核必被驳回为 D）")
+    s.add_argument("--allow-no-piaozone", action="store_true",
+                   help="允许挂没有发票云流水号的收票单（默认拦截：界面打开会报错）")
     s.set_defaults(fn=cmd_link)
 
     s = sub.add_parser("clear", help="清空报销单全部收票信息行")
@@ -634,6 +763,8 @@ def main():
     s.add_argument("--replace", action="store_true")
     s.add_argument("--with-serial", action="store_true")
     s.add_argument("--allow-steal", action="store_true")
+    s.add_argument("--allow-cross-org", action="store_true")
+    s.add_argument("--allow-no-piaozone", action="store_true")
     s.set_defaults(fn=cmd_verify)
 
     # 让 --travel 写在子命令「前」或「后」都能生效

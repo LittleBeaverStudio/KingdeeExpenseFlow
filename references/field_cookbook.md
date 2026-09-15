@@ -277,6 +277,12 @@ FLINKBILLTYPE, FLINKBILLID, FLINKIVNUMBER, FPDFURL, FPIAOZONESERIALNUMBER, FDocu
 
 #### 已确认死路（不必再试）
 - `ER_ExpReimbursement` 的 18 个操作里**没有**"选择发票"类操作 → `ExecuteOperation` 调按钮不可行。
+  ⚠️ **这条的后果比"不可行"严重**：既然官方没有开放"补发票"的 WebAPI 入口，
+  用 WebAPI 挂票就只能**直接 Save `FRecInvInfo` 子表**，也就是**跳过发票云的取票与组织归属校验**。
+  校验会推迟到界面/审核环节 → 「Save ✅ / Submit ✅ / 界面打开 ❌ → 单据变 D」。
+  所以 **`SOURCEORGID`（购方组织）必须等于报销单组织**，且收票单必须是发票云归集的
+  （`FPDFURL` / `FPIAOZONESERIALNUMBER` 非空）。详见 `recvin_link.py::guard_recv_invoices()`
+  与 SKILL.md「跨组织报销：禁止」。
 - `FEntity` 内 `FRecInvBillNo`/`FReimbLinkInvCode`/`FInvNumber` 官方单据也是空的 → 不用填。
 - 收票单侧设 `FLINKBILLID` 后重存报销单 → 不会自动回填收票信息（方向反了；正确方向是写报销单侧）。
 
