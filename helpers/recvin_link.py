@@ -135,13 +135,29 @@ class Kingdee:
         self._login()
 
     # ── 底层 HTTP ──
-    def _post(self, path, payload, timeout=90):
-        req = urllib.request.Request(
-            self.base + path,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with self._opener.open(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+    def _post(self, path, payload, timeout=90, retries=5, retry_wait=6):
+        """POST 到 WebAPI。
+
+        ⚠️ **出口代理会偶发瞬时故障**，实测形态：
+          - `urllib.error.URLError: <urlopen error Tunnel connection failed: 502 Bad Gateway>`
+          - `urllib.error.URLError: <urlopen error _ssl.c:1015: The handshake operation timed out>`
+        这不是金蝶的问题，重试即可通（2026-09-15 实测连错 4 次后第 5 次成功）。
+        所以这里默认 **重试 5 次、每次间隔 6s**，避免把网络抖动误报成业务失败。
+        """
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        last = None
+        for i in range(max(1, retries)):
+            req = urllib.request.Request(
+                self.base + path, data=body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with self._opener.open(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last = e
+                if i < retries - 1:
+                    time.sleep(retry_wait)
+        raise SystemExit(f"网络异常（已重试 {retries} 次仍失败）：{last}")
 
     def _svc(self, method, formid, data_obj, timeout=90):
         return self._post(KSVC_SUFFIX + method + ".common.kdsvc", {
@@ -158,12 +174,26 @@ class Kingdee:
     # ── 业务接口 ──
     @staticmethod
     def _unwrap_error(r):
-        """金蝶出错时返回 [[{"Result":{"ResponseStatus":{...Errors...}}}]] 形状的包裹体。"""
-        if isinstance(r, list) and r and isinstance(r[0], dict):
-            st = (r[0].get("Result", {}) or {}).get("ResponseStatus", {}) or {}
-            if not st.get("IsSuccess", True):
-                msg = json.dumps(st.get("Errors", []), ensure_ascii=False)[:300]
-                raise SystemExit(f"金蝶接口报错（MsgCode={st.get('MsgCode')}）：{msg}")
+        """金蝶出错时返回 [[{"Result":{"ResponseStatus":{...Errors...}}}]] 形状的包裹体。
+
+        ⚠️ 2026-09-15 修：外层常是**双层 list**（`[[{...}]]`）——旧实现只判 `r[0]` 是不是
+        dict，遇到嵌套 list 直接跳过，于是 `query()` 里
+        `[row for row in r if isinstance(row, list)]` 会把**那个错误对象当成一行业务数据返回**，
+        不报错、不抛异常，调用方以为查到了数据。典型触发：字段名写错
+        （如给报销单查 `FCostOrgID`，实际该表单没有这个字段）。
+        现在改为**先剥掉所有嵌套 list** 再判，杜绝这类静默错。
+        """
+        node = r
+        while isinstance(node, (list, tuple)):
+            if not node:
+                return
+            node = node[0]
+        if not isinstance(node, dict):
+            return
+        st = (node.get("Result", {}) or {}).get("ResponseStatus", {}) or {}
+        if not st.get("IsSuccess", True):
+            msg = json.dumps(st.get("Errors", []), ensure_ascii=False)[:300]
+            raise SystemExit(f"金蝶接口报错（MsgCode={st.get('MsgCode')}）：{msg}")
 
     def query(self, formid, fields, filter_string="", top=100, order=""):
         """ExecuteBillQuery。fields 用 View 风格名（如 FBillNo / FIVNUMBER）。返回二维列表。"""
