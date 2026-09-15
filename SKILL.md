@@ -14,7 +14,9 @@ metadata:
     - 发票
 ---
 
-# 金蝶费用/差旅报销全流程提交 Skill
+# 金蝶云星空报销助手
+
+> 小河狸工作室出品 ｜ 覆盖「费用 / 差旅」两条报销线的**全流程提交**：申请单 → 下推报销单 → 挂发票 → 提交审批。
 
 本 skill 处理**写操作**（提交单据、下推、创建收票单、上传附件、提交审批），与只读导出的 `kingdee-data-exporter` 互补。两者共用 `config.py` 的 `KINGDEE_CONFIG`（base_url / acctid / username / password）。
 
