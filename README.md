@@ -3,6 +3,8 @@
 > 对外销售、集成进收费产品或服务、托管 / SaaS / 代运营、以及**向第三方交付成果或提供服务，须事先取得书面授权**。
 > 许可全文见 [LICENSE](./LICENSE)。商业授权：https://littlebeaver.top
 
+[![License](https://img.shields.io/badge/License-%E5%B0%8F%E6%B2%B3%E7%8B%B8%E9%9D%9E%E8%BD%AC%E5%94%AE%E8%AE%B8%E5%8F%AF-blue.svg)](./LICENSE)
+
 # 金蝶云星空报销流程 Skill
 
 让员工**不登录金蝶云星空**，直接在对话框里把发票交上来，由 AI 完成「费用申请单 → 报销单 → 挂发票 → 提交审批」的全过程。适合需要报销但不想学金蝶操作的业务同事，以及想把报销流程接进自己系统的开发者。
