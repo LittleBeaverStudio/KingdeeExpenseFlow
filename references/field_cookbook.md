@@ -64,7 +64,7 @@ body：
 
 | 字段 | 示例值 | 说明 |
 |---|---|---|
-| `FIVNUMBER` | `"24000000000000000002"` | 发票号码 |
+| `FIVNUMBER` | `"24000000000000000001"` | 发票号码 |
 | `FIVCODE` | `""` | 发票代码（电子发票常空） |
 | `FINVOICETYPE` | `"26"` | 电子发票 |
 | `FOPENDATE` | `"2026-08-26"` | 开票日期 |
@@ -82,7 +82,7 @@ body：
 | `FSOURCEORGID` | `{"FNumber":"101"}` | 来源组织 |
 | `FSETTLEORGID` | `{"FNumber":"101"}` | 结算组织 |
 | `FLINKBILLTYPE` | `"ER_ExpReimbursement"` | 链接单据类型 |
-| `FLINKBILLID` | `101701` | 链接报销单 FID |
+| `FLINKBILLID` | `100008` | 链接报销单 FID |
 | `FLINKIVNUMBER` | `""` | 链接报销单编号（草稿为空） |
 
 > 图片 `PICTUREURL` 走票总管(piaozone.com)外部服务；本环境发票图 OCR 由发票云/票总管完成，WebAPI 直建收票单可不带图（金额字段即可）。
@@ -162,13 +162,13 @@ Save 时必须加 `F` 前缀：
 
 **可用工具**：`helpers/recvin_link.py`（本 skill 自带，纯标准库）
 ```bash
-python helpers/recvin_link.py find 24000000000000000002      # 按发票号找收票单
-python helpers/recvin_link.py list 101717                    # 看报销单现有收票信息
-python helpers/recvin_link.py link 101717 SPD00008518        # 挂上去（追加）
-python helpers/recvin_link.py link 101717 SPD00008518 --replace   # 覆盖式写入
-python helpers/recvin_link.py clear 101717                        # 清空全部
-python helpers/recvin_link.py verify 101717 SPD00008518      # 定位→写→回读→联动校验
-python helpers/recvin_link.py --travel link 101717 SPD00008518     # 差旅费报销单
+python helpers/recvin_link.py find 24000000000000000001      # 按发票号找收票单
+python helpers/recvin_link.py list 100001                    # 看报销单现有收票信息
+python helpers/recvin_link.py link 100001 SPD00000001        # 挂上去（追加）
+python helpers/recvin_link.py link 100001 SPD00000001 --replace   # 覆盖式写入
+python helpers/recvin_link.py clear 100001                        # 清空全部
+python helpers/recvin_link.py verify 100001 SPD00000001      # 定位→写→回读→联动校验
+python helpers/recvin_link.py --travel link 100001 SPD00000001     # 差旅费报销单
 ```
 
 **核心写法（必须严格遵守层级）**：
@@ -178,9 +178,9 @@ formid = "ER_ExpReimbursement"            # 或 "ER_ExpReimbursement_Travel"
 data = {
   "IsDeleteEntry": "false",               # false=追加（安全） / true=覆盖（删除未列出的行）
   "Model": {
-    "FID": 101717,
+    "FID": 100001,
     "FRecInvInfo": [                      # ★ 实体数组，实体名用 Save Key = FRecInvInfo
-      {"FRecInv": {"FBillNo": "SPD00008518"}}      # ★ 收票单引用，FBillNo = 收票单号
+      {"FRecInv": {"FBillNo": "SPD00000001"}}      # ★ 收票单引用，FBillNo = 收票单号
     ]
   }
 }
@@ -197,9 +197,9 @@ data = {
 **实测验证（示例科技生产环境，2026-09-14）**：
 | 验证项 | 结果 |
 |---|---|
-| 报销单 101717 挂收票单 SPD00008518 | ✅ `RecInvInfo` 1 行，发票号/价税合计/销方全部自动带出 |
-| 收票单侧自动回写 | ✅ 118519: `LINKBILLTYPE=ER_ExpReimbursement` `LINKBILLID=101717` `LINKIVNUMBER=FYBX20260101000002` `LINKBILLDATE=2026-09-14` |
-| 与官方单据对比（101716 ← 118632/118633） | ✅ 逐字段一致，含 `FReimbAndRecInvInfo`/`FEInvoiceEntity` 均为 0 行（我们不缺东西） |
+| 报销单 100001 挂收票单 SPD00000001 | ✅ `RecInvInfo` 1 行，发票号/价税合计/销方全部自动带出 |
+| 收票单侧自动回写 | ✅ 110001: `LINKBILLTYPE=ER_ExpReimbursement` `LINKBILLID=100001` `LINKIVNUMBER=FYBX20260101000001` `LINKBILLDATE=2026-09-14` |
+| 与官方单据对比（100004 ← 110002/110003） | ✅ 逐字段一致，含 `FReimbAndRecInvInfo`/`FEInvoiceEntity` 均为 0 行（我们不缺东西） |
 | 差旅费报销单 | ✅ 实体结构完全相同，同一写法通用（未在真实差旅单上跑，结构已核对） |
 
 ### 4.2.1 ⚠️ 三个前置事实（决定你能不能用这条路）
@@ -218,7 +218,7 @@ data = {
 | # | 曾经的判断 | 实测真相 |
 |---|---|---|
 | 1 | `FRecInv` 被字段级锁定（`IsNewLock`/`IsEditLock`=True），标准 Save 必然写不进 | ❌ **错**。实测 `FRecInv` **可以**被 WebAPI Save 写入。**不要只凭 IsNewLock/IsEditLock 就下"写不进"的结论** |
-| 2 | 要把 `FIVSerialNo`（发票序列号）当入口写 | ❌ **错**。官方流程产物的 `FIVSERIALNO` 是空的（101714/101716 实测均为 `" "`）。承载关联的是 `FRecInv` |
+| 2 | 要把 `FIVSerialNo`（发票序列号）当入口写 | ❌ **错**。官方流程产物的 `FIVSERIALNO` 是空的（100003/100004 实测均为 `" "`）。承载关联的是 `FRecInv` |
 | 3 | 位置是三级嵌套 `FEntity[].FEInvoiceEntity[].RecInvInfo[]` | ❌ **错**。就在**表头级**，与 `FEntity`/`FEInvoiceEntity` 平级的独立实体 |
 
 **真正让 7 种写法全失败的是"字段层级放错"**：把 `FRecInv`/`FIVSerialNo` 写到 `Model` 单据头层级
@@ -297,7 +297,7 @@ FLINKBILLTYPE, FLINKBILLID, FLINKIVNUMBER, FPDFURL, FPIAOZONESERIALNUMBER, FDocu
   用 View 里的名字去查 `FCONTACTUNIT` 会得到 `None`，极易误判成"这字段不存在"。
 - 可用**局部更新**：`NeedUpDateFields=["FCONTACTUNIT","FCONTACTUNITTYPE"]`，Model 只传这两个 + `FID`。
 - **规律：`FCONTACTUNIT` = 申请人本人**。官方单据实测一致：
-  101716 `ProposerID=100175(王爱丽/009)` → `CONTACTUNIT=100175/009`；101714 `100226(赵六/060)` → `100226/060`。
+  100004 `ProposerID=100175(王爱丽/009)` → `CONTACTUNIT=100175/009`；100003 `100226(赵六/060)` → `100226/060`。
 - ⚠️ **修正旧结论**：本环境下推生成的报销单 `FCONTACTUNIT` 为空，但**空着也能 Submit 成功**
   （2026-09-14 实测，Submit 未做该校验）。→ 它**不是硬性前置**，但单据不完整，建议仍补上。
 - 工具：`recvin_link.py set-contact <FID> <员工号>`
@@ -312,9 +312,9 @@ POST .../DynamicFormService.Submit.common.kdsvc
                      "IgnoreInterationFlag":""})}
 ```
 
-**实测结果**：FID 101717 / FYBX20260101000002，`IsSuccess=True`、`MsgCode=0`，
+**实测结果**：FID 100001 / FYBX20260101000001，`IsSuccess=True`、`MsgCode=0`，
 状态 **A(暂存) → B(已提交)**，且**提交后收票信息保持 1 行**（关联未被清掉）。
-`SuccessEntitys: [{"Id":"101717","Number":"FYBX20260101000002","DIndex":0}]`
+`SuccessEntitys: [{"Id":"100001","Number":"FYBX20260101000001","DIndex":0}]`
 
 **真实前提（实测修正）**：
 1. 收票信息必须已挂有效收票单，且**发票价税合计 ≥ 报销金额** ← **这是硬性的**
@@ -331,7 +331,7 @@ POST .../DynamicFormService.Submit.common.kdsvc
 ```json
 {"NeedUpDateFields":["FExpenseAmount","FExpSubmitAmount","FLocExpSubmitAmount","FLOCNOTAXAMOUNT","FTaxSubmitAmt"],
  "IsDeleteEntry":"false",
- "Model":{"FID":101718,"FEntity":[{"FEntryID":106899,
+ "Model":{"FID":100002,"FEntity":[{"FEntryID":105001,
    "FExpenseAmount":8.00,"FExpSubmitAmount":8.00,"FLocExpSubmitAmount":8.00,
    "FLOCNOTAXAMOUNT":8.00,"FTaxSubmitAmt":8.00}]}}
 ```
@@ -348,7 +348,7 @@ POST .../DynamicFormService.Submit.common.kdsvc
 ### 4.8 明细 ↔ 发票联动表 `FReimbAndRecInvInfo`（= UI「合并生成费用明细」的底层）— ✅ 已实测可写
 
 报销单 18 个 Operation 里**没有**「合并生成费用明细」这个可调操作；它只是 UI 选票时的联动动作，
-底层落到两处数据。对照真实样本 `FYBX20260101000004`(FID 101698) 复刻：
+底层落到两处数据。对照真实样本 `FYBX20260101000003`(FID 100010) 复刻：
 
 | 实体 | Key / View 名 | 字段 | 说明 |
 |---|---|---|---|
@@ -362,14 +362,14 @@ POST .../DynamicFormService.Submit.common.kdsvc
 | | | `FRecInvBillNo` / `FInvNumber` / `FInvOpenDate` | 收票单号（多个逗号分隔）/ 发票号码 / 开票日期 |
 
 ```json
-{"FID":101718,"FReimbAndRecInvInfo":[
+{"FID":100002,"FReimbAndRecInvInfo":[
  {"FReimbLinkRecInvCode":"fd2e35ee05f78c0a","FRecInvFid":118635,"FRecInvEntryId":146292,
-  "FInvAllAmt":11.50,"FInvAmt":11.17,"FInvTaxAmt":0.33,"FRecInvoiceBillNo":"SPD00008634","FInsurancePremium":0.0},
+  "FInvAllAmt":11.50,"FInvAmt":11.17,"FInvTaxAmt":0.33,"FRecInvoiceBillNo":"SPD00000002","FInsurancePremium":0.0},
  {"FReimbLinkRecInvCode":"fd2e35ee05f78c0a","FRecInvFid":118635,"FRecInvEntryId":146293,
-  "FInvAllAmt":-3.50,"FInvAmt":-3.40,"FInvTaxAmt":-0.10,"FRecInvoiceBillNo":"SPD00008634","FInsurancePremium":0.0}]}
+  "FInvAllAmt":-3.50,"FInvAmt":-3.40,"FInvTaxAmt":-0.10,"FRecInvoiceBillNo":"SPD00000002","FInsurancePremium":0.0}]}
 ```
 校验：`Σ FInvAllAmt` 应 = 发票价税合计（本例 11.50 − 3.50 = 8.00 ✅）。
-**联动表不是必需**：真实已审核单 101714/101716 就是 0 行，照样过审。别把它当阻断项。
+**联动表不是必需**：真实已审核单 100003/100004 就是 0 行，照样过审。别把它当阻断项。
 
 ### 4.6 上传发票"生成费用明细"三选项 — 员工提交失败的主因
 

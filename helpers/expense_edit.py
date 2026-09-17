@@ -32,10 +32,10 @@
   往来单位：View 显示 CONTACTUNIT，Save 键是 FCONTACTUNIT
 
 用法：
-  python expense_edit.py attach  101718 "D:/x/行程单.pdf"
-  python expense_edit.py set-detail 101718 --entry 106899 --amount 8.00
-  python expense_edit.py linkage 101718 --recv SPD00008634 --entry 106899
-  python expense_edit.py check   101718
+  python expense_edit.py attach  100002 "D:/x/行程单.pdf"
+  python expense_edit.py set-detail 100002 --entry 105001 --amount 8.00
+  python expense_edit.py linkage 100002 --recv SPD00000002 --entry 105001
+  python expense_edit.py check   100002
 """
 import os
 import sys
@@ -260,7 +260,7 @@ def main():
 
     s = sub.add_parser("linkage", help="写明细↔发票联动关系")
     s.add_argument("fid")
-    s.add_argument("--recv", required=True, help="收票单号，如 SPD00008634")
+    s.add_argument("--recv", required=True, help="收票单号，如 SPD00000002")
     s.add_argument("--entry", type=int, required=True, help="明细分录内码 FEntryID")
     s.add_argument("--link-code", help="联动标识（默认由 fid+收票单内码 派生 16 位）")
 

@@ -16,7 +16,7 @@
 // 引用SDK组件Kingdee.BOS.WebApi.Client.dll; SDK下载地址：https://openapi.open.kingdee.com/ApiSdkCenter
 var client = new K3CloudApi();
 // 初始化登录认证，appID、appSec可在"第三方系统登录授权"中获取
-client.InitClient("1930568647881801728", "appID", "appSec", "userName", 2052, "100", "https://zyzm.ik3cloud.com/k3cloud/");
+client.InitClient("1234567890123456789", "appID", "appSec", "userName", 2052, "100", "https://your-host.ik3cloud.com/k3cloud/");
 client.Submit("ER_ExpReimbursement","{"CreateOrgId":0,"Numbers":[],"Ids":"","SelectedPostId":0,"UseOrgId":0,"NetworkCtrl":"","IgnoreInterationFlag":""}");
 
 四、JSON格式数据：

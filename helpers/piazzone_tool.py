@@ -10,11 +10,11 @@
 #        PIAZZONE_CLIENT_ID / PIAZZONE_CLIENT_SECRET / PIAZZONE_TAX_NO / PIAZZONE_GHF_MC
 #        PIAZZONE_BASE_URL（可选，默认 https://api.piazzone.com）
 #   2) 同目录 piazzone_companies.json 中 --company <key> 对应条目（多公司集中管理）
-#   3) 内置示例 bjadu / ziyang / dev（仅演示，可删）
+#   3) 内置示例 example-a / example-b / dev（仅演示，可删）
 #
 # 使用：
-#   连通性自检：   python piazzone_tool.py --company bjadu
-#   绑定发票：     python piazzone_tool.py --company bjadu bind <bxd_key> <bill_no> <bill_type> <流水号CSV> [eid] [--bill-type-id FYBX]
+#   连通性自检：   python piazzone_tool.py --company example-a
+#   绑定发票：     python piazzone_tool.py --company example-a bind <bxd_key> <bill_no> <bill_type> <流水号CSV> [eid] [--bill-type-id FYBX]
 #   环境变量接入： PIAZZONE_CLIENT_ID=xxx PIAZZONE_CLIENT_SECRET=yyy PIAZZONE_TAX_NO=zzz python piazzone_tool.py
 #
 # bill_type（必填类别，对应官方 billType 枚举）：
@@ -37,7 +37,7 @@ import sys, os, json, time, hashlib, hmac, urllib.request, urllib.error
 
 # ════════════ 内置示例企业（演示用，部署时可删；真实凭证来自配置/环境变量）════════════
 BUILTIN = {
-    "bjadu": {
+    "example-a": {
         "base_url": "https://api.piaozone.com",
         "tax_no": "91110000000000000X",
         "ghf_mc": "示例科技有限公司",
@@ -45,7 +45,7 @@ BUILTIN = {
         "client_secret": "请填写你的client_secret",
         "enc_type": 0,
     },
-    "ziyang": {
+    "example-b": {
         "base_url": "https://api.piaozone.com",
         "tax_no": "91510000000000000X",
         "ghf_mc": "示例二科技有限公司",
@@ -90,7 +90,7 @@ def load_config(company):
             envs.update(data.get("companies", data))
         except Exception as e:
             print(f"[!] 读取 {cfg_path} 失败：{e}")
-    cfg = dict(envs.get(company) or envs.get("bjadu"))
+    cfg = dict(envs.get(company) or envs.get("example-a"))
     # 环境变量覆盖（单公司零文件接入）
     if os.environ.get("PIAZZONE_CLIENT_ID"):
         cfg["client_id"] = os.environ["PIAZZONE_CLIENT_ID"]
@@ -314,7 +314,7 @@ def _rand():
 def main():
     global API_BASE, TAX_NO, GHF_MC, CLIENT_ID, CLIENT_SECRET, ENC_TYPE, BASE_URLS
     args = sys.argv[1:]
-    company = "bjadu"
+    company = "example-a"
     for flag in ("--company", "--org"):
         if flag in args:
             i = args.index(flag)
@@ -339,8 +339,8 @@ def main():
         print(f"金蝶单据类型ID(billTypeId) = {bill_type_id}")
 
     if not args or args[0] == "test":
-        print("\n>>> 连通性自检：getUserKey（bxd_key=101698, billType=\"\"）...")
-        r = get_user_key(bxd_key="101698")
+        print("\n>>> 连通性自检：getUserKey（bxd_key=100010, billType=\"\"）...")
+        r = get_user_key(bxd_key="100010")
         print(json.dumps(r, ensure_ascii=False, indent=2)[:1000])
         if r.get("errcode") == "NETWORK":
             print("\n[!] 候选域名全部不通（" + "、".join(r.get("tried") or []) + "）。"
@@ -358,8 +358,8 @@ def main():
         if len(args) < 5:
             print("用法：python piazzone_tool.py --company <key> bind <bxd_key> <bill_no> <bill_type> <流水号CSV> [eid] [--bill-type-id FYBX]")
             print("  bill_type 取值：''=费用报销单  Tra=差旅费报销单  Pur=采购  BizOut=对公")
-            print("例：  python piazzone_tool.py --company bjadu bind 101698 FYBX001 \"\" 118390001,118390002")
-            print("例：  python piazzone_tool.py --company bjadu bind 101698 FYBX001 Tra 118390001 --bill-type-id FYBX")
+            print("例：  python piazzone_tool.py --company example-a bind 100010 FYBX001 \"\" 118390001,118390002")
+            print("例：  python piazzone_tool.py --company example-a bind 100010 FYBX001 Tra 118390001 --bill-type-id FYBX")
             return
         bxd_key = args[1]; bill_no = args[2]; bill_type = args[3]
         serials = [s.strip() for s in args[4].split(",") if s.strip()]

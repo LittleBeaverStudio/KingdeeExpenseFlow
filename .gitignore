@@ -25,3 +25,6 @@ piazzone_companies.json
 项目状态-*.md
 边界测试报告-*.html
 _*.py
+
+# 内部工作稿与智能体记忆（禁止外发）
+.workbuddy/
