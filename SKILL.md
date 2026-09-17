@@ -2,13 +2,13 @@
 name: kingdee-expense-flow
 slug: kingdee-expense-flow
 displayName: 金蝶云星空报销助手
-version: 2.0.2
+version: 2.0.3
 summary: 小河狸工作室出品：金蝶云星空费用/差旅报销全流程提交，员工不登录金蝶也能报销。
 description: 小河狸工作室出品。金蝶云星空「费用/差旅报销全流程」提交 Skill：员工无需登录金蝶，在对话里把发票交上来，agent 用纯 WebAPI 完成「费用申请单 → 下推报销单 → 挂收票信息／传附件 → 提交审批」，差旅线结构同构。内置发票 OCR 清晰度与抬头校验、收票信息 vs 附件分流（行程单双算预警）、跨组织挂票与发票云流水号拦截、提交前体检、报销制度提醒。
 license: 小河狸非转售许可 1.0（企业内部使用免费，转售收费需授权）
 tags: [金蝶云星空, 费用报销, 差旅报销, 财务自动化, WebAPI, 发票]
 metadata:
-  version: 2.0.2
+  version: 2.0.3
   author: 小河狸工作室
   tags:
     - 金蝶云星空
@@ -50,7 +50,7 @@ metadata:
 
 本 skill 处理**写操作**（提交单据、下推、创建收票单、上传附件、提交审批），与只读导出的 `kingdee-data-exporter` 互补。
 
-## 安装与配置（首次使用）
+## 安装与配置
 
 ### 1. 依赖
 
@@ -60,15 +60,31 @@ python -m pip install -r requirements.txt
 
 本 skill 的 `helpers/` 全部是**纯标准库**（含 `recvin_link.py`），核心写票功能无需第三方包。
 
-### 2. 配置连接（任选一种，优先级从高到低）
+### 2. 连接配置：通常**不需要你做任何事**
 
-| 方式 | 位置 | 说明 |
-|---|---|---|
-| 环境变量 | `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | 不落盘，适合分发/CI |
-| **用户级 JSON**（推荐） | `~/.workbuddy/kingdee/config.json` | 技能升级/重装不会覆盖，与 `kingdee-data-exporter` 共用同一份 |
-| 导出技能 config.py | `kingdee-data-exporter/config.py` | 早期写法，继续兼容 |
+本 skill **不单独保存账号密码**，也没有独立的配置项。只要机器上已经装好并配置过
+[`kingdee-data-exporter`](https://github.com/LittleBeaverStudio/KingdeeDataExporter)，
+本 skill 会**自动复用它的连接配置**，不需要重复填写。
 
-用户级 JSON 写法（**只填账套名称即可，acctid 会自动解析**）：
+确认是否已就绪 —— 在导出技能目录执行（五步全绿即可）：
+
+```bash
+python data_exporter.py --doctor
+```
+
+> 为什么本 skill 自己也要读一次凭据？因为它要做**写操作**（提交单据、下推、挂传附件），
+> 而导出技能是**只读**的、不提供写接口。所以连接动作必须自己完成，
+> 但读的是**同一份配置**，用户不需要多填任何东西。
+
+### 3. 只有这几种情况才需要自己配
+
+| 情况 | 做法 |
+|---|---|
+| 没装导出技能，想单独用本 skill | 写 `~/.workbuddy/kingdee/config.json`（见下方），只填账套名称即可 |
+| CI / 无人值守环境 | 用环境变量 `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` |
+| 已经在用导出技能的 `config.py` 旧写法 | **无需操作**，本 skill 同样兼容 |
+
+自己配的话，写这个（`~/.workbuddy/kingdee/config.json`，技能目录之外，升级不覆盖）：
 
 ```json
 {
@@ -79,26 +95,22 @@ python -m pip install -r requirements.txt
 }
 ```
 
-不想自己找账套 ID 时，先跑一次（免账号密码）：
+不需要自己找账套 ID —— 只填账套名称，脚本会自动解析；想列出来看看就跑一次
+（这个接口**免账号密码**）：
 
 ```bash
 python data_exporter.py --list-datacenters
 ```
 
-### 3. 配完先自检
+### 4. 连不上时
 
-```bash
-python data_exporter.py --doctor
-```
+优先跑导出技能的 `--doctor`，它会逐步定位是配置、网络、账套、登录还是权限问题。
 
-五步判定：配置 → 服务器连通 → 账套定位 → 登录 → 取数冒烟。哪一步失败就给哪一步的修复动作。
-最常见的两种：**WebAPI 白名单未配**（报 `MsgCode 11`，与账号密码无关，需管理员在
-「基础管理 → 公共设置 → 参数设置 → 基础管理 → BOS平台 → WebAPI → 允许调用WebAPI接口用户」加入账号）
-和**密码大小写错**。
+**WebAPI 白名单未配**是最常见的（报 `MsgCode 11`，**与账号密码无关**）：
+让金蝶管理员在「基础管理 → 公共设置 → 参数设置 → 基础管理 → BOS平台 → WebAPI →
+「允许调用WebAPI接口用户」」加入取数账号。
 
-> ⚠️ 密码连续错约 5 次会锁账号。本 skill 不做自动重试。
-> 未装 `kingdee-data-exporter` 时，本 skill 仍可用 `KINGDEE_*` 环境变量或用户级 JSON 独立运行；
-> 需要 `--doctor` / `--list-datacenters` 等自检能力时，才需要安装它（SkillHub 搜 `kingdee-data-exporter`）。
+> ⚠️ 密码连续错约 5 次会锁账号，本 skill 不做自动重试。
 
 ## 四种单据与下推关系（formid 已实测/已确认）
 
