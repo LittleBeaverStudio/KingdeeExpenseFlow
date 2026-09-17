@@ -31,23 +31,46 @@
 python --version   # 需要 3.8 或更高
 ```
 
-### 2. 填写本地配置
+### 2. 连接配置：通常不需要你做任何事
 
-复制 `config.example.py` 为 `config.py`，然后填写：
+本 Skill **不单独保存账号密码**，也没有独立的配置项。只要机器上装好并配置过
+[`kingdee-data-exporter`](https://github.com/LittleBeaverStudio/KingdeeDataExporter)
+（金蝶云星空数据导出），本 Skill 会**自动复用它的连接配置**，不需要重复填写。
 
-```python
-KINGDEE_CONFIG = {
-    "base_url": "https://你的金蝶地址/k3cloud/",
-    "acctid": "账套ID",
-    "username": "用户名",
-    "password": "密码",
+确认是否已就绪 —— 在导出技能目录执行（五步全绿即可）：
+
+```bash
+python data_exporter.py --doctor
+```
+
+**只有这几种情况才需要自己配**：
+
+| 情况 | 做法 |
+|---|---|
+| 没装导出技能，想单独用本 Skill | 写 `~/.workbuddy/kingdee/config.json`，只填账套名称即可 |
+| CI / 无人值守 | 用环境变量 `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` |
+| 已经在用导出技能的 `config.py` 旧写法 | **无需操作**，同样兼容 |
+
+自己配的话写这个（`~/.workbuddy/kingdee/config.json`，在技能目录之外，升级不覆盖）：
+
+```json
+{
+  "base_url": "https://你的域名/k3cloud/",
+  "acct_name": "账套名称",
+  "username": "集成账号",
+  "password": "密码"
 }
 ```
 
-> 🔐 `config.py` 已加入 `.gitignore`。不要把真实账号、密码或账套 ID 提交到公开仓库。
-> 也可以用环境变量 `KINGDEE_BASE_URL` / `KINGDEE_ACCTID` / `KINGDEE_USERNAME` / `KINGDEE_PASSWORD`，优先级高于文件。
+> 账套 ID 不用自己找 —— 只填账套名称会自动解析；想列出来看看就跑一次
+> （免账号密码）：`python data_exporter.py --list-datacenters`
 
-建议给这个 Skill **单独建一个集成用户**，只授予报销相关单据与收票单的权限，不要用管理员账号。
+> 🔐 无论哪种方式，都不要把真实账号、密码或账套 ID 提交到公开仓库。
+> 建议给这个 Skill **单独建一个集成用户**，只授予报销相关单据与收票单的权限，不要用管理员账号。
+
+> 为什么本 Skill 自己也要读一次凭据？因为它要做**写操作**（提交单据、下推、挂传附件），
+> 而导出技能是**只读**的、不提供写接口。连接动作必须自己完成，但读的是**同一份配置**，
+> 用户不需要多填任何东西。
 
 ### 3. 先做一次只读体检
 
