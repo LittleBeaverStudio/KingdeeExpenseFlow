@@ -2,13 +2,13 @@
 name: kingdee-expense-flow
 slug: kingdee-expense-flow
 displayName: 金蝶云星空报销助手
-version: 2.0.3
+version: 2.0.4
 summary: 小河狸工作室出品：金蝶云星空费用/差旅报销全流程提交，员工不登录金蝶也能报销。
 description: 小河狸工作室出品。金蝶云星空「费用/差旅报销全流程」提交 Skill：员工无需登录金蝶，在对话里把发票交上来，agent 用纯 WebAPI 完成「费用申请单 → 下推报销单 → 挂收票信息／传附件 → 提交审批」，差旅线结构同构。内置发票 OCR 清晰度与抬头校验、收票信息 vs 附件分流（行程单双算预警）、跨组织挂票与发票云流水号拦截、提交前体检、报销制度提醒。
 license: 小河狸非转售许可 1.0（企业内部使用免费，转售收费需授权）
 tags: [金蝶云星空, 费用报销, 差旅报销, 财务自动化, WebAPI, 发票]
 metadata:
-  version: 2.0.3
+  version: 2.0.4
   author: 小河狸工作室
   tags:
     - 金蝶云星空
