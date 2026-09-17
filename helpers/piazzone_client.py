@@ -282,9 +282,9 @@ def bind_invoices_to_expense(bxd_key: str, bill_no: str, bill_type_id: str,
 if __name__ == "__main__":
     print("签名自检 encType=%d:" % ENC_TYPE, gen_sign(CLIENT_ID, CLIENT_SECRET, 1234567890000))
     print("当前 API_BASE =", API_BASE)
-    print("\n>>> 测试 getUserKey (bxd_key=101698)...")
+    print("\n>>> 测试 getUserKey (bxd_key=100010)...")
     try:
-        r = get_user_key(bxd_key="101698", ghf_mc=GHF_MC)
+        r = get_user_key(bxd_key="100010", ghf_mc=GHF_MC)
         print(json.dumps(r, ensure_ascii=False, indent=1)[:800])
     except Exception as e:
         print("getUserKey 异常:", repr(e))

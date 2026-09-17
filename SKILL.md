@@ -2,13 +2,13 @@
 name: kingdee-expense-flow
 slug: kingdee-expense-flow
 displayName: 金蝶云星空报销助手
-version: 1.0.2
+version: 2.0.1
 summary: 小河狸工作室出品：金蝶云星空费用/差旅报销全流程提交，员工不登录金蝶也能报销。
 description: 小河狸工作室出品。金蝶云星空「费用/差旅报销全流程」提交 Skill：员工无需登录金蝶，在对话里把发票交上来，agent 用纯 WebAPI 完成「费用申请单 → 下推报销单 → 挂收票信息／传附件 → 提交审批」，差旅线结构同构。内置发票 OCR 清晰度与抬头校验、收票信息 vs 附件分流（行程单双算预警）、跨组织挂票与发票云流水号拦截、提交前体检、报销制度提醒。
 license: 小河狸非转售许可 1.0（企业内部使用免费，转售收费需授权）
 tags: [金蝶云星空, 费用报销, 差旅报销, 财务自动化, WebAPI, 发票]
 metadata:
-  version: 1.0.2
+  version: 2.0.1
   author: 小河狸工作室
   tags:
     - 金蝶云星空
@@ -36,13 +36,63 @@ metadata:
 
 > ⚠️ 字段说明：`slug` / `displayName` / `version` / `summary` / `tags` 是 **SkillHub（skillhub.cn）发布**要求的顶层字段
 > （CLI 校验必须有 `slug`+`version`+`displayName`，否则 `skillhub publish` 直接 die）；
-> `name` + `metadata` 是 **ClawHub / agentskills** 规范要求的。两套并存，互不影响。
+> `name` + `metadata` 是 **agentskills** 规范要求的。两套并存，互不影响。
 
 # 金蝶云星空报销助手
 
 > 小河狸工作室出品 ｜ 覆盖「费用 / 差旅」两条报销线的**全流程提交**：申请单 → 下推报销单 → 挂发票 → 提交审批。
 
-本 skill 处理**写操作**（提交单据、下推、创建收票单、上传附件、提交审批），与只读导出的 `kingdee-data-exporter` 互补。两者共用 `config.py` 的 `KINGDEE_CONFIG`（base_url / acctid / username / password）。
+本 skill 处理**写操作**（提交单据、下推、创建收票单、上传附件、提交审批），与只读导出的 `kingdee-data-exporter` 互补。
+
+## 安装与配置（首次使用）
+
+### 1. 依赖
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+本 skill 的 `helpers/` 全部是**纯标准库**（含 `recvin_link.py`），核心写票功能无需第三方包。
+
+### 2. 配置连接（任选一种，优先级从高到低）
+
+| 方式 | 位置 | 说明 |
+|---|---|---|
+| 环境变量 | `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | 不落盘，适合分发/CI |
+| **用户级 JSON**（推荐） | `~/.workbuddy/kingdee/config.json` | 技能升级/重装不会覆盖，与 `kingdee-data-exporter` 共用同一份 |
+| 导出技能 config.py | `kingdee-data-exporter/config.py` | 早期写法，继续兼容 |
+
+用户级 JSON 写法（**只填账套名称即可，acctid 会自动解析**）：
+
+```json
+{
+  "base_url": "https://你的域名/k3cloud/",
+  "acct_name": "账套名称",
+  "username": "集成账号",
+  "password": "密码"
+}
+```
+
+不想自己找账套 ID 时，先跑一次（免账号密码）：
+
+```bash
+python data_exporter.py --list-datacenters
+```
+
+### 3. 配完先自检
+
+```bash
+python data_exporter.py --doctor
+```
+
+五步判定：配置 → 服务器连通 → 账套定位 → 登录 → 取数冒烟。哪一步失败就给哪一步的修复动作。
+最常见的两种：**WebAPI 白名单未配**（报 `MsgCode 11`，与账号密码无关，需管理员在
+「基础管理 → 公共设置 → 参数设置 → 基础管理 → BOS平台 → WebAPI → 允许调用WebAPI接口用户」加入账号）
+和**密码大小写错**。
+
+> ⚠️ 密码连续错约 5 次会锁账号。本 skill 不做自动重试。
+> 未装 `kingdee-data-exporter` 时，本 skill 仍可用 `KINGDEE_*` 环境变量或用户级 JSON 独立运行；
+> 需要 `--doctor` / `--list-datacenters` 等自检能力时，才需要安装它（SkillHub 搜 `kingdee-data-exporter`）。
 
 ## 四种单据与下推关系（formid 已实测/已确认）
 
@@ -96,7 +146,7 @@ metadata:
      ② 联动表 `FReimbAndRecInvInfo` 逐条发票分录（`FRecInvFid`/`FRecInvEntryId`/`FInvAllAmt`）。
    - ```bash
      python helpers/expense_edit.py set-detail <FID> --entry <明细分录内码> --amount 8.00
-     python helpers/expense_edit.py linkage <FID> --recv SPD00008634 --entry <明细分录内码>
+     python helpers/expense_edit.py linkage <FID> --recv SPD00000002 --entry <明细分录内码>
      ```
    - `recvin_link.py set-contact` 要先跑：`ValidateFlag=true` 时 `FCONTACTUNIT` 是**必填**（MsgCode=11）。
 6. **附件分流**：行程单/说明走 `AttachmentUpLoad`，**不要**传收票信息（会双算）。
@@ -169,8 +219,8 @@ metadata:
 
 | 报销单 | 组织 | 收票单 | 组织归属 | 发票云流水号 | 实际报错 |
 |---|---|---|---|---|---|
-| 101720 | 104 | SPD00008634 | ❌ 属 101 | ❌ **空**（非发票云归集） | 「无法获取…发票云发票流水号」 |
-| 101721 | 105 | SPD00008518 | ❌ 属 101 | ✅ 有（`GENERATETYPE=4`） | 「【收票服务】许可已过期失效 [0300]」 |
+| 100005 | 104 | SPD00000002 | ❌ 属 101 | ❌ **空**（非发票云归集） | 「无法获取…发票云发票流水号」 |
+| 100006 | 105 | SPD00000001 | ❌ 属 101 | ✅ 有（`GENERATETYPE=4`） | 「【收票服务】许可已过期失效 [0300]」 |
 
 → 两张单的失败**都可以归到"票不是本组织的"**：
 第 3 条（105 许可过期）是**叠加**上去的独立故障 —— 就算票是 105 自己的，105 现在也收不了票。
@@ -183,8 +233,8 @@ metadata:
 
 | 收票单 | SOURCEORGID / PURNAME | SETTLEORGID 原 | 被挂后 | LINK 字段 |
 |---|---|---|---|---|
-| SPD00008634 | 101 / 示例科技有限公司 | 101 | **104** | → 101720 / FYBX…0001 |
-| SPD00008518 | 101 / 示例科技有限公司 | 101 | **105** | → 101721 / FYBX…0002 |
+| SPD00000002 | 101 / 示例科技有限公司 | 101 | **104** | → 100005 / FYBX…0001 |
+| SPD00000001 | 101 / 示例科技有限公司 | 101 | **105** | → 100006 / FYBX…0002 |
 
 → **挂错了要还原：`SETTLEORGID` 改回原组织 + 清掉 LINK 三件套**，
 否则这张票在原组织的收票核算里也是错的。
@@ -207,9 +257,9 @@ metadata:
 
 | 报销单 | 组织 | 状态 | 收票信息行数 |
 |---|---|---|---|
-| 历史单A (101710) | **105 示例二科技** | C 已审核 | **0 行** |
-| 历史单B (101715) | 104 示例四科技 | B 审核中 | 1 行 |
-| FYBX20260101000003 (101716) | 101 示例科技 | C 已审核 | 2 行 |
+| 历史单A (100007) | **105 示例二科技** | C 已审核 | **0 行** |
+| 历史单B (100009) | 104 示例四科技 | B 审核中 | 1 行 |
+| FYBX20260101000002 (100004) | 101 示例科技 | C 已审核 | 2 行 |
 
 → **org 105 的历史报销单根本不用收票信息**（0 行照样审核通过），org 104/101 才用。
 
@@ -232,14 +282,14 @@ recvin_link.py submit  <FID>                 → 提交前再拦一次（cmd_sub
 ```
 - `link` 拦截点：`guard_recv_invoices()`，**在 Save 之前** raise，**不会写库**。
 - `submit` 拦截点：`cmd_submit` → `precheck()`，**有阻断项直接 return 2，连 `Submit` 接口都不调**。
-  实测 `submit 101720` 输出「⛔ 体检有阻断项，已中止（确认要强提交请加 `--force`）」并列出
+  实测 `submit 100005` 输出「⛔ 体检有阻断项，已中止（确认要强提交请加 `--force`）」并列出
   跨组织 + 无发票云流水号两条，**没有发起任何提交**。
 - ⚠️ 也就是说：**正常走 skill 的路径，这种单现在已经"提交不过去"了**。
   唯一能绕过的是显式 `--force` / `--allow-cross-org`。
 
 ### ⚠️ 别把「收票信息为空」当阻断项（2026-09-15 修正）
 曾经把它列为 blocks，理由是"大概率报发票金额不允许小于报销金额"——**实测推翻**：
-`101710`（org 105）**报销金额 1,309,161.65、收票信息 0 行**，照样 Submit 成功并走到 `C` 已审核。
+`100007`（org 105）**报销金额 金额以实际单据为准、收票信息 0 行**，照样 Submit 成功并走到 `C` 已审核。
 → 已降级为 warn。否则会把 org 105 这类"走附件"的正常单据误拦。
 
 ### 📌 提交后的状态流转（D 的真正成因已查明）
@@ -257,8 +307,8 @@ recvin_link.py submit  <FID>                 → 提交前再拦一次（cmd_sub
   也就是说 —— 只要界面要按**本组织税号**去发票云取这张票（打开发票、补发票、重新上传、
   后续审核/结算），都会取不到。`D` 同理：金蝶把"操作被拒绝"写作"驳回"，
   所以 `APPROVERID` 一直是空的 —— **根本没有审批人参与**。
-- **全环境基线**（2026-09-15 取 300 张报销单）：`C`×297、`B`×1（101715 长期卡住）、
-  `D`×2（正好就是本次跨组织测试的 101720 / 101721）。
+- **全环境基线**（2026-09-15 取 300 张报销单）：`C`×297、`B`×1（100009 长期卡住）、
+  `D`×2（正好就是本次跨组织测试的 100005 / 100006）。
   → **跨组织挂票是本环境唯一出现 `D` 的单**，其余走 org 自己的票都能到 `C`。
 
 **所以真正的风险落点不是「提交失败」，而是「提交成功、但单据在界面里没法继续走」**：
@@ -272,10 +322,10 @@ recvin_link.py submit  <FID>                 → 提交前再拦一次（cmd_sub
 
 ### ⚠️ 两条复核项（本次实测顺带发现）
 
-1. **同一张发票不要既挂「收票信息」又传「附件」**（101721 就是这种情况：收票信息 1 行
-   `SPD00008518` + 同一张票的图片附件）。两个入口都会被财务看到，口径上算 **重复佐证**，
+1. **同一张发票不要既挂「收票信息」又传「附件」**（100006 就是这种情况：收票信息 1 行
+   `SPD00000001` + 同一张票的图片附件）。两个入口都会被财务看到，口径上算 **重复佐证**，
    应二选一。默认：**能挂收票信息就只挂收票信息**；只有该组织既有做法是走附件（如 org 105）才走附件。
-2. **收票单上的联查号可能是「悬空号」**：`SPD00008634` 的 `FLINKIVNUMBER = CLFBX00000001`，
+2. **收票单上的联查号可能是「悬空号」**：`SPD00000002` 的 `FLINKIVNUMBER = CLFBX00000001`，
    但该差旅报销单**已不存在**（某次下推占号后未保存/被删）。
    → 挂票前若看到 `FLINKIVNUMBER` 有值，**先按单号反查该单是否真的存在**，
    别把它当成"这张票已经被用掉了"而误判。
@@ -327,7 +377,7 @@ recvin_link.py submit  <FID>                 → 提交前再拦一次（cmd_sub
 - **字段层级是历史 7 种写法全失败的真凶**：`FRecInv`/`FIVSerialNo` 必须放在 `Model.FRecInvInfo[]`
   **数组行内**。放到单据头层级会明确报错 `…实体不存在此属性！[EntityType：BillHead Propeyt…]`
   —— 看到 `[EntityType：BillHead]` 就是层级放错了。
-- **`FIVSerialNo`(发票序列号) 不必写**：官方流程产物的 `FIVSERIALNO` 实测是空的（101714/101716 均为 `" "`），
+- **`FIVSerialNo`(发票序列号) 不必写**：官方流程产物的 `FIVSERIALNO` 实测是空的（100003/100004 均为 `" "`），
   承载关联的是 `FRecInv`。它是可选装饰，不是入口。
   （顺带：它的正确值若真要填，是收票单 `FPDFURL` 尾部 **32 位** hash，**不是** `FPIAOZONESERIALNUMBER` 那个 33 位。）
 - **防抢关联**：一张收票单只能属于一张报销单。把它挂到第二张单上会**静默改掉**原单的关联，
@@ -373,9 +423,9 @@ recvin_link.py submit  <FID>                 → 提交前再拦一次（cmd_sub
 - **「合并生成费用明细」没有对应的可调操作**（18 个 Operation 里没有）。它的效果 = 写
   联动表 `FReimbAndRecInvInfo` + 明细侧 `FReimbLinkInvCode`。明细侧那几个字段元数据标着
   `IsNewLock/IsEditLock=True`，但**实测可写**（又一次印证"锁标记 ≠ 写不进"）。
-  对照真实样本 `FYBX20260101000004`(FID 101698) 复刻结构最稳。
-- **联动表不是必需的**：真实已审核单 101714/101716 的 `FReimbAndRecInvInfo` 就是 0 行，照样审核通过。
-  只有走过 UI「联动处理」的单才有（如 101698 有 5 行）。所以别把"联动 0 行"当成提交阻断项。
+  对照真实样本 `FYBX20260101000003`(FID 100010) 复刻结构最稳。
+- **联动表不是必需的**：真实已审核单 100003/100004 的 `FReimbAndRecInvInfo` 就是 0 行，照样审核通过。
+  只有走过 UI「联动处理」的单才有（如 100010 有 5 行）。所以别把"联动 0 行"当成提交阻断项。
 
 - **`ExecuteBillQuery` 报错时返回「双层 list」包裹体**（`[[{"Result":{"ResponseStatus":…}}]]`）：
   旧版 `_unwrap_error` 只判 `r[0]` 是不是 dict，遇到嵌套 list 会**静默跳过**，

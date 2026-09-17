@@ -17,9 +17,9 @@
   1. **字段层级放错**：FRecInv / FIVSerialNo 必须放在 `Model.FRecInvInfo[]` 数组行内。
      放到单据头层级会报：
        ResolveFiled_InnerEx解析字段(Key:FIVSerialNo…)…实体不存在此属性！[EntityType：BillHead…]
-  2. **死磕 FIVSerialNo**：官方流程产物的 FIVSERIALNO 是空的（实测 101714/101716 均为 " "）。
+  2. **死磕 FIVSerialNo**：官方流程产物的 FIVSERIALNO 是空的（实测 100003/100004 均为 " "）。
      真正承载关联的是 `FRecInv`（收票单）。FIVSerialNo 是可选装饰，不是入口。
-     ⚠️ **但这条只在「同组织」成立**（101714/101716 都是本组织的票）：
+     ⚠️ **但这条只在「同组织」成立**（100003/100004 都是本组织的票）：
      跨组织时，界面要拿**报销单组织的税号**去发票云解析这张票，
      而票是别人的 → 取不到发票云流水号 → 报「驳回：无法获取当前关联收票单的
      发票云发票流水号」→ 单据变 `D`。详见 `guard_recv_invoices()`。
@@ -51,10 +51,10 @@
 ════════════════════════════════════════════════════════════════════════
 已验证事实（示例科技生产环境，2026-09-14）
 ════════════════════════════════════════════════════════════════════════
-· 报销单 101717 (FYBX20260101000002) 写入收票单 SPD00008518 → RecInvInfo 1 行 ✅
-· 联动自动回填：118519.LINKBILLTYPE=ER_ExpReimbursement, LINKBILLID=101717,
-              LINKIVNUMBER=FYBX20260101000002, LINKBILLDATE=2026-09-14 ✅
-· 与官方流程产物对比（101716 ← 118632/118633）逐字段一致 ✅
+· 报销单 100001 (FYBX20260101000001) 写入收票单 SPD00000001 → RecInvInfo 1 行 ✅
+· 联动自动回填：110001.LINKBILLTYPE=ER_ExpReimbursement, LINKBILLID=100001,
+              LINKIVNUMBER=FYBX20260101000001, LINKBILLDATE=2026-09-14 ✅
+· 与官方流程产物对比（100004 ← 110002/110003）逐字段一致 ✅
 · 费用明细 FEntity(=ER_ExpenseReimbEntry) 未被 IsDeleteEntry=true 误删 ✅
 · 只需收票单号即可，FIVSerialNo 可不写（官方也不写）✅ —— **仅限同组织**（见上「边界」）
 · ⚠️ 反面实测（2026-09-15）：跨组织挂票 Save/Submit 均成功，但单据全部被驳回为 `D`。
@@ -76,29 +76,31 @@
 用法
 ════════════════════════════════════════════════════════════════════════
 # 1) 按发票号码查收票单（拿到收票单号）
-python recvin_link.py find 24000000000000000002
+python recvin_link.py find 24000000000000000001
 
 # 2) 查看报销单当前收票信息
-python recvin_link.py list 101717
+python recvin_link.py list 100001
 
 # 3) 把收票单挂到报销单「收票信息」（追加，不删已有行）
-python recvin_link.py link 101717 SPD00008518
+python recvin_link.py link 100001 SPD00000001
 
 #    覆盖模式（清掉未列出的行，用于纠错）
-python recvin_link.py link 101717 SPD00008518,SPD00008631 --replace
+python recvin_link.py link 100001 SPD00000001,SPD00000003 --replace
 
 #    差旅费报销单（--travel 放子命令前或后都可以）
-python recvin_link.py --travel link 101717 SPD00008518
+python recvin_link.py --travel link 100001 SPD00000001
 
 #    连发票云流水号一起写（可选；官方流程留空，一般不需要）
-python recvin_link.py link 101717 SPD00008518 --with-serial
+python recvin_link.py link 100001 SPD00000001 --with-serial
 
 # 4) 一键自检：写→读→校验收票单侧联动
-python recvin_link.py verify 101717 SPD00008518
+python recvin_link.py verify 100001 SPD00000001
 
 配置来源（优先级）：
-  1) 环境变量 KINGDEE_BASE_URL / KINGDEE_ACCTID / KINGDEE_USERNAME / KINGDEE_PASSWORD
-  2) kingdee-data-exporter 的 config.py 里的 KINGDEE_CONFIG（本机默认）
+  1) 环境变量 KINGDEE_BASE_URL / KINGDEE_ACCTID（或 KINGDEE_ACCT_NAME）
+     / KINGDEE_USERNAME / KINGDEE_PASSWORD
+  2) ~/.workbuddy/kingdee/config.json（推荐：技能目录之外，升级/重装不会覆盖）
+  3) kingdee-data-exporter 的 config.py 里的 KINGDEE_CONFIG（早期写法，继续兼容）
 分发给他司时，用环境变量即可，无需改代码。
 """
 import os
@@ -114,6 +116,80 @@ import urllib.error
 # ────────────────────────── 配置 ──────────────────────────
 KSVC_SUFFIX = "Kingdee.BOS.WebApi.ServicesStub.DynamicFormService."
 AUTH_SUFFIX = "Kingdee.BOS.WebApi.ServicesStub.AuthService.ValidateUser.common.kdsvc"
+DC_SUFFIX = ("Kingdee.BOS.ServiceFacade.ServicesStub.Account.AccountService."
+             "GetDataCenterList.common.kdsvc")
+
+
+def _normalize_base(base_url):
+    """补全 base_url：确保以 /k3cloud/ 结尾且不重复拼接。"""
+    text = str(base_url or "").strip().rstrip("/")
+    if not text:
+        return ""
+    if text.lower().endswith("/k3cloud"):
+        return text + "/"
+    return text + "/k3cloud/"
+
+
+def _fetch_datacenters(base, retries=5, retry_wait=6):
+    """拉取账套列表（免认证），返回 [{id, name}]。
+
+    ⚠️ 出口代理会偶发瞬时故障（实测形态：空响应 / 502 Bad Gateway），
+    与 `Kingdee._post` 保持一致做重试，避免把网络抖动误报成"账套不存在"。
+    """
+    import base64
+    import gzip
+
+    url = base + DC_SUFFIX
+    last_error = None
+    for attempt in range(max(1, retries)):
+        try:
+            req = urllib.request.Request(
+                url, data=b"{}",
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+            text = raw.decode("utf-8", "replace").strip()
+            if not text:
+                raise ValueError("响应为空")
+            if text.startswith("H4sI"):  # 部分环境把响应 base64+gzip 后再返回
+                text = gzip.decompress(base64.b64decode(text)).decode("utf-8", "replace")
+            data = json.loads(text)
+            rows = data if isinstance(data, list) else (data.get("Data") or [])
+            out = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                lower = {str(k).lower(): v for k, v in item.items()}
+                if str(lower.get("id") or "").strip():
+                    out.append({"id": str(lower["id"]).strip(),
+                                "name": str(lower.get("name") or "").strip()})
+            return out
+        except Exception as exc:  # 网络抖动或响应异常 → 重试
+            last_error = exc
+            if attempt < retries - 1:
+                time.sleep(retry_wait)
+    raise SystemExit(
+        f"拉取账套列表失败（已重试 {retries} 次）：{last_error}\n"
+        f"  请求地址：{url}\n"
+        "  → 检查 base_url 是否可达、是否含 /k3cloud/（内网访问需连 VPN）。"
+    )
+
+
+def _login_hint(text):
+    """把「登录失败」拆成可执行的根因。"""
+    if "未指定允许调用WebAPI接口" in text:
+        return ("该账号没有被加入 WebAPI 白名单（与账号密码无关，最高频故障）。\n"
+                "  让金蝶管理员操作：基础管理 → 公共设置 → 参数设置 → 基础管理 → BOS平台 → WebAPI\n"
+                "  → 「允许调用WebAPI接口用户」加入取数账号 → 保存。")
+    if "数据中心无法获取到" in text:
+        return "账套 ID 不对。用 `python data_exporter.py --list-datacenters` 查正确 Id，或改填 acct_name。"
+    if "用户名或密码错误" in text or "CheckPasswordPolicy" in text:
+        return "账号或密码错，注意大小写与首尾空格。⚠️ 密码连续错约 5 次会锁号，不要反复重试。"
+    if "没有权限" in text:
+        return "该账号缺少对应模块权限，找管理员开通，或换一个有权限的账号。"
+    return ""
 
 FORM_EXPENSE = "ER_ExpReimbursement"           # 费用报销单
 FORM_TRAVEL = "ER_ExpReimbursement_Travel"     # 差旅费报销单
@@ -123,19 +199,73 @@ FORM_RECV_INV = "IV_ReceivedInvoice"           # 收票单
 RECV_ENTITY = {"save_key": "FRecInvInfo", "view_name": "RecInvInfo"}
 
 
+def _exporter_candidates():
+    """可能存放 kingdee-data-exporter 的目录（用于复用其 config.py）。"""
+    here = os.path.dirname(os.path.abspath(__file__))            # .../kingdee-expense-flow/helpers
+    skill_dir = os.path.dirname(here)                            # .../kingdee-expense-flow
+    home_skills = os.path.join(os.path.expanduser("~"), ".workbuddy", "skills")
+    return (
+        os.path.join(home_skills, "kingdee-data-exporter"),
+        os.path.join(home_skills, "KingdeeDataExporter"),
+        os.path.join(os.path.dirname(skill_dir), "kingdee-data-exporter"),
+        os.path.join(os.path.dirname(skill_dir), "KingdeeDataExporter"),
+        os.path.join(skill_dir, "..", "KingdeeDataExporter"),
+    )
+
+
+def _user_config_path():
+    """技能目录之外的推荐配置位置（与 kingdee-data-exporter 共用）。"""
+    return os.path.join(os.path.expanduser("~"), ".workbuddy", "kingdee", "config.json")
+
+
+def _read_user_config():
+    """读 ~/.workbuddy/kingdee/config.json；支持扁平写法与 profiles 结构。"""
+    path = _user_config_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    profiles = data.get("profiles")
+    if isinstance(profiles, dict) and profiles:
+        want = os.environ.get("KINGDEE_PROFILE") or str(data.get("default") or "")
+        if not want:
+            want = next(iter(profiles))
+        picked = profiles.get(want)
+        if not isinstance(picked, dict):
+            return None
+        common = {k: v for k, v in data.items() if k not in ("profiles", "default")}
+        return {**common, **picked}
+    return data
+
+
 def load_kingdee_config():
-    """环境变量优先；否则回退到同机 kingdee-data-exporter 的 config.py。"""
+    """加载金蝶连接配置。
+
+    优先级：环境变量 > ~/.workbuddy/kingdee/config.json（推荐，技能目录之外）
+            > kingdee-data-exporter 的 config.py（早期写法）
+    """
     cfg = {
         "base_url": os.environ.get("KINGDEE_BASE_URL", ""),
         "acctid": os.environ.get("KINGDEE_ACCTID", ""),
+        "acct_name": os.environ.get("KINGDEE_ACCT_NAME", ""),
         "username": os.environ.get("KINGDEE_USERNAME", ""),
         "password": os.environ.get("KINGDEE_PASSWORD", ""),
         "lcid": int(os.environ.get("KINGDEE_LCID", 2052)),
     }
-    if cfg["base_url"] and cfg["acctid"] and cfg["username"]:
+    if cfg["base_url"] and cfg["username"] and cfg["password"]:
         return cfg
-    for cand in (r"C:\Users\Administrator\.workbuddy\skills\kingdee-data-exporter",
-                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+
+    user_cfg = _read_user_config()
+    if user_cfg and str(user_cfg.get("base_url") or "").strip():
+        merged = {k: v for k, v in user_cfg.items() if not isinstance(v, (dict, list))}
+        return {**cfg, **{k: v for k, v in merged.items() if v}}
+
+    for cand in _exporter_candidates():
         if os.path.exists(os.path.join(cand, "config.py")):
             sys.path.insert(0, cand)
             try:
@@ -143,7 +273,27 @@ def load_kingdee_config():
                 return {**cfg, **{k: v for k, v in KC.items() if v}}
             except Exception:
                 pass
-    raise SystemExit("未找到金蝶配置：请设 KINGDEE_BASE_URL/KINGDEE_ACCTID/KINGDEE_USERNAME/KINGDEE_PASSWORD")
+
+    raise SystemExit(
+        "未找到金蝶连接配置。任选一种方式配置：\n"
+        "\n"
+        "  方式一（推荐，技能升级/重装不会覆盖）：写 ~/.workbuddy/kingdee/config.json\n"
+        '    {"base_url": "https://你的域名/k3cloud/", "acct_name": "账套名称",\n'
+        '     "username": "取数账号", "password": "密码"}\n'
+        "    账套 ID 不用自己找——只填 acct_name 会自动解析，或跑下面第 3 步列出全部账套。\n"
+        "\n"
+        "  方式二（环境变量，不落盘）：\n"
+        "    KINGDEE_BASE_URL / KINGDEE_ACCTID（或 KINGDEE_ACCT_NAME）\n"
+        "    / KINGDEE_USERNAME / KINGDEE_PASSWORD\n"
+        "\n"
+        "  方式三：安装并配置「金蝶云星空数据导出」技能（kingdee-data-exporter），本技能会复用它的 config.py。\n"
+        "\n"
+        "配完请自检（会逐步定位是配置、网络、账套、登录还是权限问题）：\n"
+        "  cd <kingdee-data-exporter 目录> && python data_exporter.py --doctor\n"
+        "列出服务器上的全部账套：\n"
+        "  python data_exporter.py --list-datacenters\n"
+        "⚠️ 密码连续错约 5 次会锁账号，不要反复重试。"
+    )
 
 
 class Kingdee:
@@ -154,7 +304,7 @@ class Kingdee:
     """
 
     def __init__(self, cfg):
-        self.base = cfg["base_url"].rstrip("/") + "/k3cloud/"
+        self.base = _normalize_base(cfg["base_url"])
         self.cfg = cfg
         self._jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(
@@ -191,12 +341,44 @@ class Kingdee:
             "formid": formid,
             "data": json.dumps(data_obj, ensure_ascii=False)}, timeout=timeout)
 
+    def _resolve_acctid(self):
+        """acctid 为空时按 acct_name 自动解析（GetDataCenterList 免认证，登录前可用）。"""
+        acctid = str(self.cfg.get("acctid") or "").strip()
+        if acctid:
+            return acctid
+        name = str(self.cfg.get("acct_name") or "").strip()
+        if not name:
+            raise SystemExit(
+                "未配置账套：请在配置里填 acctid，或填 acct_name（账套名称）由脚本自动解析。\n"
+                "  列出服务器上的全部账套（免账号密码）：python data_exporter.py --list-datacenters"
+            )
+        centers = _fetch_datacenters(self.base)
+        hits = [c for c in centers if c["name"] == name] or [c for c in centers if name in c["name"]]
+        if len(hits) == 1:
+            print(f"  按账套名称「{name}」解析到 acctid={hits[0]['id']}")
+            self.cfg["acctid"] = hits[0]["id"]
+            return hits[0]["id"]
+        if len(hits) > 1:
+            shown = "、".join(f"{c['name']}({c['id']})" for c in hits)
+            raise SystemExit(f"账套名称「{name}」匹配到多个：{shown}。请写完整名称，或直接填 acctid。")
+        available = "、".join(c["name"] for c in centers[:10]) or "（服务器未返回账套列表）"
+        raise SystemExit(f"账套名称「{name}」不在该服务器的账套列表里。可用账套：{available}")
+
     def _login(self):
+        acctid = self._resolve_acctid()
         r = self._post(AUTH_SUFFIX, {
-            "acctid": self.cfg["acctid"], "username": self.cfg["username"],
+            "acctid": acctid, "username": self.cfg["username"],
             "password": self.cfg["password"], "lcid": self.cfg.get("lcid", 2052)}, timeout=30)
         if r.get("LoginResultType") != 1:
-            raise SystemExit(f"金蝶登录失败：{json.dumps(r, ensure_ascii=False)[:300]}")
+            raw = json.dumps(r, ensure_ascii=False)
+            message = f"金蝶登录失败：{raw[:300]}"
+            hint = _login_hint(str(r.get("Message") or "") + raw)
+            if hint:
+                message += f"\n  → {hint}"
+            else:
+                message += ("\n  → 先跑自检逐步定位：在 kingdee-data-exporter 目录执行 "
+                            "`python data_exporter.py --doctor`")
+            raise SystemExit(message)
 
     # ── 业务接口 ──
     @staticmethod
@@ -345,7 +527,7 @@ class Kingdee:
         返回 (blocks, warns, rows)：blocks 非空就不该写。
 
         ── 为什么必须查这个 ──────────────────────────────────────────
-        2026-09-15 实测：把示例科技的收票单挂到 101720(org104)/101721(org105)，
+        2026-09-15 实测：把示例科技的收票单挂到 100005(org104)/100006(org105)，
         `Save` 成功、`Submit` 成功（当场读到 B），**但两张单随后都变成 `D`
         （重新审核＝审核驳回）**，界面上点「查看发票」直接报：
 
@@ -387,7 +569,7 @@ class Kingdee:
              allow_cross_org=False, allow_no_piaozone=False):
         """把收票单挂到报销单「收票信息」。
 
-        recv_bill_nos : 收票单号列表（如 ['SPD00008518']）
+        recv_bill_nos : 收票单号列表（如 ['SPD00000001']）
         replace       : True=覆盖（Model 中未出现的行会被删除）；False=追加（默认，最安全）
         with_serial   : 是否同时写 FIVSerialNo（取收票单 FPDFURL 尾部 hash = 发票云 fid）。
                         官方流程留空，一般不需要。
@@ -537,7 +719,7 @@ class Kingdee:
                          "（B/C 也可 Submit/流转，但请确认是否重复提交）")
         if not rows:
             # ⚠️ 曾经是 blocks —— 2026-09-15 实测推翻：
-            #    101710（org 105 示例二科技）**报销金额 1,309,161.65、收票信息 0 行**，
+            #    100007（org 105 示例二科技）**报销金额 金额以实际单据为准、收票信息 0 行**，
             #    照样 Submit 成功并走到 C 已审核（该组织的既有做法就是走附件）。
             #    所以"收票信息为空"不能当阻断项，否则会把 105 这类组织的正常单据误拦。
             warns.append("收票信息为空 —— 若该组织既有做法是走附件（如 org 105），这是正常的；"
@@ -569,7 +751,7 @@ def _fmt_inv(hit):
 
 
 def cmd_find(kd, a):
-    # ⚠️ 实践反馈：用户常把「收票单号 SPD00008634」直接丢给 find，而 find 原本只按
+    # ⚠️ 实践反馈：用户常把「收票单号 SPD00000002」直接丢给 find，而 find 原本只按
     #    发票号码查 → 报「收票单池里没有这张发票」，误以为票不存在。
     #    这里自动判别：SPD 开头 / 非纯数字 → 当收票单号；全是数字 → 当发票号码。
     arg = (a.invoice_no or a.bill_no or "").strip()
