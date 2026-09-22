@@ -7,6 +7,8 @@ venv/
 config.py
 piazzone_config.py
 piazzone_companies.json
+policy_rules.local.md
+references/*.local.md
 *.pyc
 *.pdf
 *.jpg

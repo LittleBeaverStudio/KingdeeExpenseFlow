@@ -10,6 +10,10 @@ config.py
 piazzone_config.py
 piazzone_companies.json
 
+# 本公司报销制度（policy_rules.md 里只是空模板，实填的规则放这个本地文件）
+policy_rules.local.md
+references/*.local.md
+
 # 单据与发票原件（含个人与企业信息，禁止提交）
 *.pdf
 *.jpg
