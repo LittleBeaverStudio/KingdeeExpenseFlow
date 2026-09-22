@@ -46,7 +46,8 @@
   · 收票单要是**发票云归集**来的：`FPDFURL` / `FPIAOZONESERIALNUMBER` 非空。
   · 目标组织**收票服务许可**须在有效期内（实测示例二科技 105 已过期，
     发票云报「…【收票服务】许可已过期失效…[0300]」）。
-  需绕过时用 `--allow-cross-org` / `--allow-no-piaozone` 显式声明（默认全拦）。
+  ⚠️ **v2.0.11 起这三条全部是硬拦截，没有任何逃生口**（曾经的 `--allow-cross-org` /
+  `--allow-no-piaozone` / `--allow-no-invoice` / `--force` 已删除）。
 
 ════════════════════════════════════════════════════════════════════════
 已验证事实（示例科技生产环境，2026-09-14）
@@ -115,6 +116,11 @@ import urllib.error
 
 # ────────────────────────── 配置 ──────────────────────────
 KSVC_SUFFIX = "Kingdee.BOS.WebApi.ServicesStub.DynamicFormService."
+# ⚠️ **唯一的登录入口**（v2.0.11 起）：账号口令登录。
+# 本 skill 不再提供第二条登录分支（曾试过 `LoginByAppSecret` 第三方系统登录授权，
+# 已评估移除：金蝶侧的「集成用户」需要额外账号与后台配置，落地成本高于收益，
+# 且会让 skill 出现两个登录口、两套配置键 —— 登录口应当只有一个，即复用
+# `kingdee-data-exporter` 的配置 + `ValidateUser`）。
 AUTH_SUFFIX = "Kingdee.BOS.WebApi.ServicesStub.AuthService.ValidateUser.common.kdsvc"
 DC_SUFFIX = ("Kingdee.BOS.ServiceFacade.ServicesStub.Account.AccountService."
              "GetDataCenterList.common.kdsvc")
@@ -194,6 +200,16 @@ def _login_hint(text):
 FORM_EXPENSE = "ER_ExpReimbursement"           # 费用报销单
 FORM_TRAVEL = "ER_ExpReimbursement_Travel"     # 差旅费报销单
 FORM_RECV_INV = "IV_ReceivedInvoice"           # 收票单
+
+# ────────────────────────────────────────────────────────────────────────────
+# 🔒 政策常量（v2.0.11）
+# ────────────────────────────────────────────────────────────────────────────
+# 默认**空** = 一律要求「必须挂了带发票云流水号的收票单」才能提交，
+# 且收票单来源组织必须与报销单组织一致。
+# 若某个组织确实有「走附件、不挂收票单」的既定财务政策（历史上 org 105 曾如此），
+# 由**维护者改这一行源码**显式登记组织编号 —— 不提供任何命令行开关或运行时逃生口，
+# 确保"能绕过去"这件事必须经过一次代码评审。
+ATTACHMENT_ONLY_ORGS = ()          # 例：("105",) —— 默认空，即不允许任何组织走附件路线
 
 # 两类报销单的收票信息实体（Save Key / View EntryName）——结构相同
 RECV_ENTITY = {"save_key": "FRecInvInfo", "view_name": "RecInvInfo"}
@@ -424,8 +440,20 @@ class Kingdee:
         return out
 
     def save(self, formid, model, is_delete_entry=False, need_update=None, timeout=90,
-             retries=4, retry_wait=8):
+             retries=4, retry_wait=8, validate_flag=False):
         """标准 Save。返回 (是否成功, ResponseStatus)。
+
+        ⚠️⚠️ **`validate_flag=False`（默认）会关掉金蝶的业务校验 —— 包括
+        「发票金额不允许小于报销金额！」**。2026-09-22 实测（同一张**不挂任何发票**的差旅报销单）：
+
+        | 报文 | 结果 |
+        |---|---|
+        | `ValidateFlag=true`  | ❌ `MsgCode=11`，Errors 含 **「发票金额不允许小于报销金额！」** |
+        | `ValidateFlag=false` | ✅ `IsSuccess=true`，单据正常生成（CLFBX…），随后 Submit 也能到 `B` |
+
+        → 也就是说：**UI 上会被拦的「无发票 / 发票不足」单据，用本 skill 的默认参数能写进去。**
+        这是能力，也是**风险**：等于造了一张 UI 造不出、后续审核/财务大概率退回的单。
+        写入前想知道「UI 会不会接受」，先用 `strict_probe()`（CLI：`strict <FID>`）探一次。
 
         ⚠️ **瞬时的「单据编辑冲突」会自动重试**（retries 次，每次间隔 retry_wait 秒）：
            报错形如 `"XXX"使用业务单据："费用报销单"业务操作-"[费用报销单-FYBX...-修改]"冲突，请稍候再使用。`
@@ -438,7 +466,8 @@ class Kingdee:
                 "NeedUpDateFields": need_update or [], "NeedReturnFields": [],
                 "IsDeleteEntry": "true" if is_delete_entry else "false",
                 "SubSystemId": "", "IsVerifyBaseDataField": "false", "IsEntryBatchFill": "true",
-                "ValidateFlag": "false", "NumberSearch": "true", "IsAutoAdjustField": "true",
+                "ValidateFlag": "true" if validate_flag else "false",
+                "NumberSearch": "true", "IsAutoAdjustField": "true",
                 "InterationFlags": "", "IgnoreInterationFlag": "true", "IsControlPrecision": "false",
                 "ValidateRepeatJson": "true", "Model": model}, timeout=timeout)
             st = (r.get("Result", {}) or {}).get("ResponseStatus", {}) or {}
@@ -520,11 +549,16 @@ class Kingdee:
             org = org[0] if org else {}
         return _flat(org.get("Number")), _flat(org.get("Name")), o
 
-    def guard_recv_invoices(self, bill_fid, nos, formid=FORM_EXPENSE,
-                            allow_cross_org=False, allow_no_piaozone=False):
-        """挂票**前置体检**（2026-09-15 新增，血泪教训）。
+    def guard_recv_invoices(self, bill_fid, nos, formid=FORM_EXPENSE):
+        """挂票**前置体检**（2026-09-15 新增，血泪教训；v2.0.11 起为硬闸门）。
 
         返回 (blocks, warns, rows)：blocks 非空就不该写。
+
+        🔒 **v2.0.11：三道判据全部硬拦截，无逃生口。** 命中即进 `blocks`：
+          1. 收票单查不到（收票单不存在，或当前账号看不到 —— 见下方「可见性」警告）
+          2. `SOURCEORGID` ≠ 报销单组织（跨组织）
+          3. **`FPIAOZONESERIALNUMBER` 为空** —— 即「发票没经发票云采集/归集，
+             等于没真正上传过发票」。这是"不许提交没上传发票的单"在收票单层的落点。
 
         ── 为什么必须查这个 ──────────────────────────────────────────
         2026-09-15 实测：把示例科技的收票单挂到 100005(org104)/100006(org105)，
@@ -537,10 +571,16 @@ class Kingdee:
         · 收票单 `SOURCEORGID`（购方/来源组织）**必须等于报销单组织** ——
           跨组织挂票只改写 `SETTLEORGID`，改不掉"这张票是别人的"这个事实；
           UI 拿本组织税号去发票云查别人的票 → 查不到 → 驳回。
-        · 收票单还得是**发票云归集**来的（`FPDFURL` / `FPIAOZONESERIALNUMBER` 非空）；
-          手工建的、没有云流水的收票单，即使同组织也会报同一个错。
+        · 收票单必须带**发票云流水号** `FPIAOZONESERIALNUMBER`。
+          2026-09-22 补充证据：手工建的票**永远拿不到流水号**（挂单不补、事后从电子税务局
+          重新下载也不补，用户实测）→ 所以"无流水号"这条路没有任何补救余地，必须硬拒。
         · 目标组织还必须**收票服务许可在有效期内**（示例二科技 105 实测已过期；
           发票云报 `当前使用税号【…】【收票服务】许可已过期失效…[0300]`）。
+        ⚠️ **注意 `find_received_invoice()` 受「可见性」限制**（2026-09-22 实测）：
+        可见性按**来源组织**（`FSOURCEORGID`）切 —— 员工账号只看得到本组织的票
+        （取数账号 2000 张横跨 101/104/105；钱八关掉"只能查看自己单据"后也只看到 101 的）。
+        用员工账号跑本方法会把"别的组织的票"误判成「收票单不存在」→ **假阴性**。
+        **体检/挂票请用有权限的账号**（员工身份留给最终 Submit）。
         ────────────────────────────────────────────────────────────
         """
         org_no, org_name, _ = self.bill_org_no(bill_fid, formid)
@@ -548,25 +588,32 @@ class Kingdee:
         for no in nos:
             found = self.find_received_invoice(recv_bill_no=no)
             if not found:
-                blocks.append(f"{no} 收票单不存在")
+                # ⚠️ 2026-09-22：收票池可见性按「来源组织」切，所以"查不到"很可能是
+                # **当前账号看不到**，而不是这张票真的不存在。
+                # 该分支没有逃生口，会硬阻断；排查时先换有权限的账号重跑。
+                blocks.append(
+                    f"{no} 收票单不存在（或当前账号 {self.cfg.get('username')!r} 看不到它 —— "
+                    f"收票池可见性按「来源组织」切，普通员工只能看到本组织的票；"
+                    f"请换有权限的账号重跑，再判断是否真的不存在）")
                 continue
             h = found[0]
             hits.append(h)
             if str(h["src_org_no"] or "") != org_no:
-                msg = (f"{no} 属于组织 {h['src_org_no']}（购方 {h['buyer']}），"
-                       f"而报销单组织是 {org_no}（{org_name}）→ 跨组织，"
-                       f"提交后会被驳回为 D")
-                (blocks if not allow_cross_org else warns).append(msg)
-            if not (h["pdf_url"] or "").strip() and not (h["serial"] or "").strip():
-                msg = (f"{no} 没有发票云流水号（FPDFURL / FPIAOZONESERIALNUMBER 均为空）"
-                       f"→ 不是发票云归集的收票单，界面打开会报"
-                       f"「无法获取…发票云发票流水号」")
-                (blocks if not allow_no_piaozone else warns).append(msg)
+                blocks.append(
+                    f"{no} 属于组织 {h['src_org_no']}（购方 {h['buyer']}），"
+                    f"而报销单组织是 {org_no}（{org_name}）→ 跨组织挂票，"
+                    f"提交成功也会被驳回为 D（🔒 硬拦截，无逃生口）")
+            if not str(h["serial"] or "").strip():
+                blocks.append(
+                    f"{no} **没有发票云流水号**（FPIAOZONESERIALNUMBER 为空）→ 这张发票"
+                    f"没有真正经过发票云采集，等于「没上传发票」。"
+                    f"提交后界面打不开、审核会驳回为 D，且没有补救余地"
+                    f"（手工建票补不回来，事后从电子税务局重新下载也补不回来）。"
+                    f"🔒 硬拦截，无逃生口 —— 请让员工在软件/发票云里把这张票上传一次拿到流水号。")
         return blocks, warns, hits
 
     def link(self, bill_fid, recv_bill_nos, formid=FORM_EXPENSE, replace=False,
-             with_serial=False, skip_existing=True, allow_steal=False,
-             allow_cross_org=False, allow_no_piaozone=False):
+             with_serial=False, skip_existing=True, allow_steal=False):
         """把收票单挂到报销单「收票信息」。
 
         recv_bill_nos : 收票单号列表（如 ['SPD00000001']）
@@ -616,11 +663,9 @@ class Kingdee:
                     + "\n   如确需改挂，请加 --allow-steal；若只是想把它们还给原单，"
                       "用 link <原单FID> <这些收票单号> --replace。")
 
-        # ── 前置体检：跨组织 / 非发票云票，一律先拦下（2026-09-15 新增） ──
+        # ── 前置体检：跨组织 / 无发票云流水号，一律硬拦（v2.0.11：无逃生口） ──
         if todo:
-            blocks, warns, _ = self.guard_recv_invoices(
-                bill_fid, todo, formid,
-                allow_cross_org=allow_cross_org, allow_no_piaozone=allow_no_piaozone)
+            blocks, warns, _ = self.guard_recv_invoices(bill_fid, todo, formid)
             for w in warns:
                 print(f"  ⚠️ {w}")
             if blocks:
@@ -628,8 +673,8 @@ class Kingdee:
                     "❌ 挂票前置体检不通过（写进去 Save/Submit 都会成功，但单据在界面里不可用、"
                     "审核会被驳回）：\n     "
                     + "\n     ".join(blocks)
-                    + "\n   如你已明确知道后果仍要继续，加 --allow-cross-org / "
-                      "--allow-no-piaozone（两者可同时用）。")
+                    + "\n   🔒 v2.0.11 起这是硬拦截，**没有逃生口**。"
+                      "请换成「同组织 + 有发票云流水号」的收票单再挂。")
 
         serial_of = {}
         if with_serial:
@@ -656,6 +701,134 @@ class Kingdee:
             errs = st.get("Errors", [])
             raise SystemExit(f"写入失败：{json.dumps(errs[:2], ensure_ascii=False)[:500]}")
         return {"written": todo, "skipped": skipped, "response": st}
+
+    # ── 权威票解析 / 智能建票（2026-09-22 新增；`wait_serial` 已作废，见其 docstring）──
+    def resolve_authoritative(self, invoice_no, top=20):
+        """按发票号在全池解析「该用哪张收票单」（同一发票号可能有多条）。
+
+        排序（权威优先）：
+          1. 有发票云流水号 **且** 未被其它单据占用  → 直接用
+          2. 有流水号 但已被占用                     → 要 `--allow-steal` 才能改挂
+          3. 无流水号 且 未占用（手工建票）          → ⚠️ **不可用**（v2.0.11 起闸门会硬拒）
+          4. 无流水号 且 已被占用                    → 最后
+
+        ⚠️ **第 3 类不再是"可用"选项**（2026-09-22 结论已推翻）：手工建的票**不会补流水号**
+        —— 挂到同组织报销单不补，事后从电子税务局重新下载也不补（用户实测）。
+        `rank` 仍把它排在最后，只是为了**识别已存在的无号票**（历史遗留单），
+        不要拿它当兜底路径；`submit` 的闸门会以「没有发票云流水号」直接拒绝。
+
+        ⚠️ **必须用有权限的账号调用**。可见性是**按来源组织（`FSOURCEORGID`）**切的：
+        员工账号只看得到**本组织**的票（实测钱八关掉"只能查看自己单据"后能看到组织 101 的
+        18 个制单人，但看不到组织 104 的票）→ 否则会把"别的组织的票"误判成"不存在"。
+
+        返回 dict: {hit, all, reason}
+        """
+        hits = self.find_received_invoice(invoice_no=invoice_no, top=top)
+        if not hits:
+            return {"hit": None, "all": [],
+                    "reason": "池中无此发票号（未归集；或当前账号无权看到 → 换有权限账号重查）"}
+
+        def rank(h):
+            has = 0 if str(h.get("serial") or "").strip() else 1
+            used = 1 if h.get("link_bill_id") else 0
+            return (has, used)
+        ordered = sorted(hits, key=rank)
+        hit = ordered[0]
+        has = bool(str(hit.get("serial") or "").strip())
+        used = hit.get("link_bill_id")
+        if has and not used:
+            reason = "权威票：有发票云流水号、未被占用"
+        elif has and used:
+            reason = "有流水号但已被 %s 占用（改挂需 allow_steal）" % (hit.get("link_iv") or used)
+        elif not has and not used:
+            reason = ("⚠️ 无流水号、未占用（手工建票）—— **不会补号**（挂单不补、事后从电子税务局"
+                      "重新下载也不补，2026-09-22 用户实测）→ **不建议使用**；"
+                      "正确做法是等次日归集/采集后再挂")
+        else:
+            reason = "无流水号且已被其它单据占用"
+        return {"hit": hit, "all": ordered, "reason": reason}
+
+    def create_recv_invoice(self, invoice_no, amount, tax_amount=0.0, open_date=None,
+                            seller_name="", seller_tax="", buyer_name="", buyer_tax="",
+                            org_no="101", inv_type="26", item_name="", tax_rate=0.0,
+                            settle_org_no=None, check_dup=True, remark=""):
+        """手工建一张收票单。返回 `(bill_no, fid, created:bool, note)`。
+
+        🔴 **默认查重**（`check_dup=True`）：金蝶**不校验发票号重复**（实测同号能建第二张、
+        静默污染收票池），所以这里先 `resolve_authoritative()`，已存在就**直接返回那张**，
+        不再新建 —— 这是防重与防污染的**唯一防线**。
+
+        🔴 **手工建的票永远拿不到发票云流水号**（`GENERATETYPE=' '`、
+        `FPIAOZONESERIALNUMBER=' '`、`ISEXAMINE='0'`）：挂到同组织报销单**不补**，
+        事后从电子税务局重新下载**也不补**（2026-09-22 用户实测）。
+        ⛔ 曾经据 `SPD00008775`「09-21 无号 → 09-22 16:14 有号」推断的"挂单后异步补号"
+        **已作废** —— 复核发现它是**被发票云重新采集覆盖**（`GENERATETYPE` 由 `' '` 变 `'3'`
+        并出现 `FPDFURL`），不是回填。
+
+        ⇒ 所以本方法现在**只用于测试**（造票验证字段/挂票机制）或**历史遗留票补录**，用完即删。
+        **v2.0.11 起它建出来的票已经"提交不了"**：`submit` 的闸门会以「没有发票云流水号」硬拒。
+        它丢的是三重财务保护：①**防重**（发票云按 `expenseStatus` 锁票，手工票完全没有，
+        金蝶也不查同号 → 同一张票可报两次）②**可信**（税局源数据 vs OCR 猜测）
+        ③**验真**（`ISEXAMINE=0`，无查验记录、无原件 URL）。
+        """
+        if check_dup:
+            got = self.resolve_authoritative(invoice_no)
+            if got["hit"]:
+                h = got["hit"]
+                return h["bill_no"], h["fid"], False, \
+                    "已存在 %s → 不重复建（%s）" % (h["bill_no"], got["reason"])
+        net = round(float(amount) - float(tax_amount or 0), 2)
+        model = {
+            "FIVNUMBER": invoice_no, "FIVCODE": "",
+            "FOPENDATE": str(open_date or "")[:10],
+            "FSUMAMOUNT": net, "FSUMTAXAMOUNT": float(tax_amount or 0),
+            "FSUMALLAMOUNT": float(amount),
+            "FPURNAME": buyer_name, "FPURTAXNUMBER": buyer_tax,
+            "FSALENAME": seller_name, "FSALETAXNUMBER": seller_tax,
+            "FINVOICETYPE": str(inv_type or "26"),
+            "FISELECTRONIC": "true", "FSTATUS": "0", "FRemark": remark,
+            "FSOURCEORGID": {"FNumber": str(org_no)},
+            "FSETTLEORGID": {"FNumber": str(settle_org_no or org_no)},
+        }
+        if item_name:
+            model["FEntity"] = [{
+                "FITEMNAME": item_name, "FUNIT": "", "FSPECIFICATIONS": "",
+                "FQTY": 1.0, "FPRICE": net, "FAMOUNT": net,
+                "FTAXRATE": float(tax_rate or 0), "FTAXAMOUNT": float(tax_amount or 0),
+                "FTOTALAMOUNT": float(amount)}]
+        ok, st = self.save(FORM_RECV_INV, model)
+        if not ok:
+            raise SystemExit("建收票单失败：%s"
+                             % json.dumps(st.get("Errors", [])[:2], ensure_ascii=False)[:400])
+        for e in (st.get("SuccessEntitys") or []):
+            return e.get("Number"), e.get("Id"), True, "新建成功"
+        return None, None, True, "Save 成功但未返回单号（检查 SuccessEntitys 结构）"
+
+    def wait_serial(self, recv_bill_no, timeout=7200, interval=120, verbose=True):
+        """轮询等待某张收票单的**发票云流水号被异步回写**。返回 `(serial, waited, polls)`。
+
+        ⚠️ **本函数的立论已被推翻，仅作历史保留**（2026-09-22）：
+        当初据 `SPD00008775`（09-21 无号 → 09-22 16:14 有号）推断"挂单后异步补号"，
+        复核发现它是**被发票云重新采集覆盖**（`GENERATETYPE` 由 `' '` 变 `'3'`、并出现
+        `FPDFURL`），不是"补号"；且用户实测**手工建票事后从电子税务局重新下载仍无号**。
+        → 所以**不要再用它等号**；拿不到号就该走"次日归集后再挂"。
+        保留原因：若将来出现"票已由发票云采集、但号还没同步下来"的真实场景，它仍可用。
+        超时返回空串（不算错误，只是"还没等到"）。
+        """
+        t0 = time.time()
+        polls = 0
+        while True:
+            polls += 1
+            hits = self.find_received_invoice(recv_bill_no=recv_bill_no)
+            ser = str((hits[0].get("serial") if hits else "") or "").strip()
+            if ser:
+                return ser, int(time.time() - t0), polls
+            waited = time.time() - t0
+            if waited >= timeout:
+                return "", int(waited), polls
+            if verbose:
+                print("  … 等流水号回写（已等 %d 秒 / 上限 %d 秒）" % (int(waited), timeout))
+            time.sleep(max(1, min(interval, timeout - waited)))
 
     def clear_linked(self, bill_fid, formid=FORM_EXPENSE):
         """清空报销单的全部收票信息行。
@@ -693,7 +866,52 @@ class Kingdee:
         return self.save(formid, model, need_update=["FCONTACTUNIT", "FCONTACTUNITTYPE"])
 
     def submit(self, bill_fid, formid=FORM_EXPENSE, selected_post_id=0):
-        """提交单据（触发审批流）。注意：会真实发起审批，先跟用户确认。"""
+        """提交单据（触发审批流）。注意：会真实发起审批，先跟用户确认。
+
+        🔒 **闸门是强制的，没有任何参数可以关掉它**（v2.0.11 起）。
+        提交前跑三道检查，任一道不通过就**拒绝提交**并返回 `MsgCode="GUARD"`：
+
+        1. **金蝶自己的严格校验**（`strict_probe`，即 `ValidateFlag=true`）——
+           用金蝶的规则判，口径不会跑偏；命中「发票金额不允许小于报销金额！」直接拒。
+        2. **skill 自算口径**（`precheck`）—— 补第 1 道的盲区：若单据还有别的必填缺失，
+           金蝶可能在校验到发票金额**之前**就返回失败，探针的 `strict_errors` 会是空。
+        3. **发票实质检查**（同在 `precheck` 内）：收票信息 0 行 → 拒；
+           挂的收票单缺发票云流水号 → 拒；跨组织票 → 拒。
+
+        背景（2026-09-22 实测）：本 skill 的 `save()` 默认 `ValidateFlag=false`，会把
+        「发票金额不允许小于报销金额！」**整条关掉** —— 同一张 0 发票的差旅报销单，
+        `true` 报 `MsgCode=11` 被拦、`false` 却 `IsSuccess=true` 且 `Submit` 也能推到状态 B。
+        这道闸门就是为了堵住"UI 拦得住、却进了审批流"的单。
+
+        ⚠️ **历史逃生口已删除**（`allow_no_invoice` / `allow_overspend` / CLI `--force`）。
+        原因：提交进审批流后 WebAPI 撤不回来（`Delete` 只放 Z/A/D、`UnAudit` 被工作流挡），
+        "能绕过闸门"本身就是最大的风险点。若确实存在业务上必须放行的场景，
+        应当由维护者评估后改源码（例如把组织登记进 `ATTACHMENT_ONLY_ORGS`），
+        而不是留一个运行时开关。
+        """  # noqa: E501
+        probe = self.strict_probe(bill_fid, formid)
+        if probe.get("strict_errors"):
+            msg = ("🔒 闸门拦下提交：金蝶严格校验(ValidateFlag=true)判定该单不合规 → "
+                   + "；".join(probe["strict_errors"])[:300]
+                   + "。金蝶在这条 WebAPI 路径上默认会放过(ValidateFlag=false)，"
+                     "但 UI / 审核不会。"
+                     "👉 合规路径：`expense_edit.py fit <fid>` 把报销金额调到发票金额。")
+            print("  " + msg)
+            return False, {"MsgCode": "GUARD", "IsSuccess": False,
+                           "Errors": [{"Message": msg}]}
+        # 探针顺带能看出"还缺哪些必填" —— 只提示、不阻断（提交本身不校验必填）
+        missing = [m for m in (probe.get("errors") or [])
+                   if "必填" in m or "必录" in m]
+        if missing:
+            print("  ⚠️ 金蝶严格校验提示，该单还有必填项未填（不影响本次提交判定）：")
+            for m in missing[:4]:
+                print("     •", str(m)[:160])
+        pc = self.precheck(bill_fid, formid)
+        if pc["blocks"]:
+            msg = "🔒 闸门拦下提交：" + "；".join(pc["blocks"])[:400]
+            print("  " + msg)
+            return False, {"MsgCode": "GUARD", "IsSuccess": False,
+                           "Errors": [{"Message": msg}]}
         r = self._svc("Submit", formid, {
             "CreateOrgId": 0, "Numbers": [], "Ids": str(bill_fid),
             "SelectedPostId": selected_post_id, "UseOrgId": 0,
@@ -705,6 +923,16 @@ class Kingdee:
         """提交前体检。返回 dict：
         {status, bill_no, contact_unit, reimb_amt, recv_rows, inv_amt,
          blocks:[...], warns:[...]}
+
+        🔒 **本方法就是闸门本体，判据全部硬编码，没有任何放行参数**（v2.0.11）：
+          · **收票信息 0 行** → 拒（= 不允许提交「没有上传发票」的报销单）
+          · **发票价税合计 < 报销金额** → 拒（金蝶的这条校验被 `ValidateFlag=false` 关掉了，
+            所以必须自己算）
+          · **关联的收票单没有发票云流水号** → 拒（= 不允许提交「发票没真正上传」的单）
+          · **关联的收票单与报销单不同组织** → 拒（跨组织必被驳回为 D）
+        唯一的组织级例外是 `ATTACHMENT_ONLY_ORGS` —— 默认空；确需「走附件不挂票」的组织
+        由维护者改源码登记，不提供运行时开关。
+
         实测：**往来单位为空也能 Submit 成功**（不是硬性校验），但单据不完整，建议补。"""
         o = self.view(formid, bill_fid)
         rows = [r for r in (o.get(RECV_ENTITY["view_name"]) or []) if isinstance(r, dict)]
@@ -717,19 +945,33 @@ class Kingdee:
         if status != "A":
             warns.append(f"单据状态不是「暂存 A」，当前 = {status}"
                          "（B/C 也可 Submit/流转，但请确认是否重复提交）")
+        _org_no = str(self.bill_org_no(bill_fid, formid)[0] or "").strip()
+        _attachment_ok = _org_no in ATTACHMENT_ONLY_ORGS
         if not rows:
-            # ⚠️ 曾经是 blocks —— 2026-09-15 实测推翻：
-            #    100007（org 105 示例二科技）**报销金额 金额以实际单据为准、收票信息 0 行**，
-            #    照样 Submit 成功并走到 C 已审核（该组织的既有做法就是走附件）。
-            #    所以"收票信息为空"不能当阻断项，否则会把 105 这类组织的正常单据误拦。
-            warns.append("收票信息为空 —— 若该组织既有做法是走附件（如 org 105），这是正常的；"
-                         "若该组织走收票信息路线，财务可能以「发票金额小于报销金额」驳回")
+            if _attachment_ok:
+                warns.append(
+                    f"收票信息为空 —— 组织 {_org_no} 已在 ATTACHMENT_ONLY_ORGS 里登记为"
+                    "「走附件不挂票」政策，放行（这是源码级例外，不是运行时开关）")
+            else:
+                # 🔒 v2.0.11 硬拦截：没上传发票 = 不允许提交
+                blocks.append(
+                    f"🔒 **收票信息为空**（本单报销金额 {reimb_amt}）—— "
+                    "不允许提交没有上传发票的报销单。"
+                    "收票信息为空的单进审批流后，界面打不开发票、审核会驳回为 D，"
+                    "而且提交后 WebAPI 撤不回来（只能人工在 UI 驳回）。"
+                    "请先把员工的发票挂到「收票信息」再提交；"
+                    "本闸门无运行时开关（组织级例外只能由维护者改 "
+                    "`ATTACHMENT_ONLY_ORGS` 源码登记）。")
         elif inv_amt < reimb_amt:
-            blocks.append(f"发票价税合计 {inv_amt} < 报销金额 {reimb_amt}")
+            blocks.append(
+                f"发票价税合计 {inv_amt} < 报销金额 {reimb_amt}，差额 {round(reimb_amt - inv_amt, 2)}"
+                f" —— 先把报销金额调到发票金额再提交（合规做法，用 "
+                f"`expense_edit.py fit <fid>`，默认只算不写、加 --apply 才写）。"
+                f"没有绕过参数：绕过去会造出审核必退的单。")
         if not cu.get("Id"):
             warns.append("往来单位(FCONTACTUNIT)为空 —— 实测不影响 Submit，但单据不完整，建议补")
 
-        # ── 收票单组织归属 / 发票云流水号（2026-09-15 新增）──
+        # ── 收票单组织归属 / 发票云流水号（2026-09-15 新增，v2.0.11 起硬拦截）──
         # 这两条是"提交成功但界面报错、审核被驳回为 D"的真正成因，必须前置暴露。
         recv_nos = [(r.get("RecInv") or {}).get("FBillNo") for r in rows]
         recv_nos = [n for n in recv_nos if n]
@@ -740,6 +982,61 @@ class Kingdee:
         return {"status": status, "bill_no": o.get("BillNo"), "contact_unit": cu,
                 "reimb_amt": reimb_amt, "recv_rows": rows, "inv_amt": inv_amt,
                 "blocks": blocks, "warns": warns}
+
+    def strict_probe(self, bill_fid, formid=FORM_EXPENSE):
+        """**严格模式探针**：用 `ValidateFlag=true` 对单据做一次「空写入」，
+        把金蝶的业务校验错误原样抛出来 —— 用来回答"**这份单据 UI/审核会不会接受**"。
+
+        背景（2026-09-22 实测）：本 skill 的 `save()` 默认 `ValidateFlag=false`，
+        **会把「发票金额不允许小于报销金额！」这条校验一起关掉** ——
+        于是能写出 UI 拦得住的单据。写完想知道"UI 会不会拦"，就调本方法探一次。
+
+        返回 dict：{ok, msg_code, errors:[...], strict_errors:[...]}
+        - `errors` 里若出现「发票金额不允许小于报销金额」→ 该单在 UI 里过不了。
+        - 同时会带出其它必填项（往来单位 / 差旅费类型 `FTravelType` …），这些是 UI 也会要求的，
+          属于「单据本身没填完整」，不是发票问题，读的时候要分开看。
+
+        📌 2026-09-22 实测（回答"手工建的无流水号票能不能用"）：
+        把一张手工建的收票单（`GENERATETYPE=' '`、`FPIAOZONESERIALNUMBER=' '`、同组织 101）
+        挂到同组织差旅报销单上，明细金额对齐后跑本探针 →
+        - 「发票金额不允许小于报销金额！」**消失**（金额没对齐时会报，这是**唯一**发票类校验）；
+        - **没有任何「发票云流水号」相关报错** → **流水号不参与 Save 阶段校验**。
+        另注：差旅报销单明细改金额时，`FExpTravelAmount`(差旅费金额) 要与
+        `FTaxSubmitAmt`(税额) + 费用金额 保持勾稽，否则报「差旅费金额不等于税额加费用金额」。
+
+        ⚠️ 这是**只读性质的空写入**（`NeedUpDateFields=[]` + 仅 `FID`），不会改字段值；
+        但因为 `ValidateFlag=true`，**若单据本身违反必填约束会返回失败** —— 这是预期的，不是 bug。
+
+        ⚠️ 已知盲区（2026-09-22 实测）：**"编辑锁冲突"会把这个探针打断** ——
+        报 `MsgCode=4`「XXX使用业务单据…冲突，请稍候再使用」，此时 `errors` 里
+        **根本没有发票金额那一句**，`strict_errors` 为空。若拿它当唯一闸门，
+        就会在锁冲突时**静默放行**。更麻烦的是**同一账号「先 View 再 Save 探针」会自锁**
+        （2026-09-22 实测重试 2 次仍冲突），所以本方法只重试 1 次就放弃；
+        并且 `submit()` 的闸门**绝不能只靠它** —— 必须再叠一层自算口径（`precheck`），
+        越是拿不到金蝶结论，越要靠自己算。
+        """
+        st = {}
+        for attempt in range(2):
+            r = self._svc("Save", formid, {
+                "NeedUpDateFields": [], "NeedReturnFields": [],
+                "IsDeleteEntry": "false", "SubSystemId": "",
+                "IsVerifyBaseDataField": "true", "IsEntryBatchFill": "true",
+                "ValidateFlag": "true", "NumberSearch": "true", "IsAutoAdjustField": "true",
+                "InterationFlags": "", "IgnoreInterationFlag": "true",
+                "IsControlPrecision": "false", "ValidateRepeatJson": "true",
+                "Model": {"FID": bill_fid}}, timeout=120)
+            st = (r.get("Result", {}) or {}).get("ResponseStatus", {}) or {}
+            msgs = [str(e.get("Message") or "") for e in (st.get("Errors") or [])]
+            blob = json.dumps(msgs, ensure_ascii=False)
+            if "冲突" not in blob and "请稍候再使用" not in blob:
+                break
+            if attempt == 0:
+                print("  [!] 严格探针遇编辑锁冲突，等 6s 重试 1 次…")
+                time.sleep(6)
+        msgs = [str(e.get("Message") or "") for e in (st.get("Errors") or [])]
+        inv_err = [m for m in msgs if "发票金额" in m]
+        return {"ok": bool(st.get("IsSuccess")), "msg_code": st.get("MsgCode"),
+                "errors": msgs, "strict_errors": inv_err}
 
     # ────────────────────────── 命令 ──────────────────────────
 def _fmt_inv(hit):
@@ -789,9 +1086,7 @@ def cmd_link(kd, a):
     print(f"→ 报销单 {a.fid}（{formid}）"
           f"{'覆盖' if a.replace else '追加'}写入收票单 {a.nos}")
     res = kd.link(a.fid, a.nos, formid=formid, replace=a.replace,
-                  with_serial=a.with_serial, allow_steal=a.allow_steal,
-                  allow_cross_org=a.allow_cross_org,
-                  allow_no_piaozone=a.allow_no_piaozone)
+                  with_serial=a.with_serial, allow_steal=a.allow_steal)
     print(f"  ✅ 写入 {len(res['written'])} 行：{res['written']}")
     time.sleep(1)
     print("\n  回读校验：")
@@ -811,6 +1106,24 @@ def cmd_clear(kd, a):
     return 0
 
 
+def cmd_resolve(kd, a):
+    """按发票号解析「该用哪张收票单」——同号多条时选权威票（有流水号 + 未占用）。"""
+    r = kd.resolve_authoritative(a.invoice_no)
+    print("发票号 %s → 池中 %d 条" % (a.invoice_no, len(r["all"])))
+    for h in r["all"]:
+        print("   %-13s FID=%-8s 金额=%-10s 流水号=%-6s 组织=%s 挂单=%s" % (
+            h["bill_no"], h["fid"], h["amount"],
+            "有" if str(h["serial"] or "").strip() else "【空】",
+            h["src_org_no"], h["link_iv"] or "（未占用）"))
+    print()
+    if r["hit"]:
+        print("   ✅ 建议使用：%s (FID %s)" % (r["hit"]["bill_no"], r["hit"]["fid"]))
+        print("      理由：%s" % r["reason"])
+        return 0
+    print("   ❌ %s" % r["reason"])
+    return 2
+
+
 def cmd_precheck(kd, a):
     formid = FORM_TRAVEL if a.travel else FORM_EXPENSE
     r = kd.precheck(a.fid, formid)
@@ -828,6 +1141,39 @@ def cmd_precheck(kd, a):
     return 0 if not r["blocks"] else 2
 
 
+def cmd_strict(kd, a):
+    """严格模式探针：ValidateFlag=true 空写入，把金蝶业务校验错误原样抛出。"""
+    formid = FORM_TRAVEL if a.travel else FORM_EXPENSE
+    o = kd.view(formid, a.fid)
+    recv = [r for r in (o.get(RECV_ENTITY["view_name"]) or []) if isinstance(r, dict)]
+    inv = 0.0
+    for r in recv:
+        try:
+            inv += float((r.get("RecInv") or {}).get("FSUMALLAMOUNT") or 0)
+        except Exception:
+            pass
+    print(f"严格模式探针 {o.get('BillNo')} (FID {a.fid})  —— 模拟 UI/审核的业务校验")
+    print(f"  状态        : {o.get('DocumentStatus')}")
+    print(f"  报销金额    : {o.get('ExpAmountSum')}")
+    print(f"  收票信息    : {len(recv)} 行，发票价税合计 {inv}")
+    r = kd.strict_probe(a.fid, formid)
+    print(f"  ValidateFlag=true 写入结果: IsSuccess={r['ok']}  MsgCode={r['msg_code']}")
+    if r["ok"]:
+        print("  ✅ 金蝶业务校验通过 —— 这份单据 UI/审核也会接受")
+        return 0
+    for m in r["errors"]:
+        flag = "🔴" if "发票金额" in m else "•"
+        print(f"    {flag} {m}")
+    if r["strict_errors"]:
+        print()
+        print("  ⛔ 命中「发票金额不允许小于报销金额」→ 该单在 UI 里过不了（本 skill 默认参数能写进去，是越狱）")
+        return 2
+    print()
+    print("  ℹ️ 没有发票金额类错误，上面的报错都是「必填项没填完整」（UI 也会要求），"
+          "补完这些字段后再探一次")
+    return 1
+
+
 def cmd_set_contact(kd, a):
     formid = FORM_TRAVEL if a.travel else FORM_EXPENSE
     print(f"→ 给报销单 {a.fid} 补往来单位：{a.emp or ('Id=' + str(a.emp_id))}")
@@ -842,8 +1188,8 @@ def cmd_set_contact(kd, a):
 def cmd_submit(kd, a):
     formid = FORM_TRAVEL if a.travel else FORM_EXPENSE
     r = kd.precheck(a.fid, formid)
-    if r["blocks"] and not a.force:
-        print("⛔ 体检有阻断项，已中止（确认要强提交请加 --force）：")
+    if r["blocks"]:
+        print("⛔ 体检有阻断项，已中止 —— 🔒 闸门没有绕过开关：")
         for b in r["blocks"]:
             print("   ❌", b)
         return 2
@@ -853,6 +1199,11 @@ def cmd_submit(kd, a):
     ok, st = kd.submit(a.fid, formid)
     if ok:
         print(f"  ✅ 提交成功  {json.dumps(st.get('SuccessEntitys', []), ensure_ascii=False)[:200]}")
+    elif st.get("MsgCode") == "GUARD":
+        print("  🔒 提交被闸门拦下（未发出 Submit 请求）。")
+        print("     闸门没有逃生口：请按上面的提示把单据修合规（补挂带发票云流水号的收票单 / "
+              "把报销金额调到发票金额）后重试。")
+        return 3
     else:
         print(f"  ❌ 提交失败 MsgCode={st.get('MsgCode')} "
               f"{json.dumps(st.get('Errors', [])[:2], ensure_ascii=False)[:400]}")
@@ -878,9 +1229,7 @@ def cmd_verify(kd, a):
             print("   ", _fmt_inv(h))
     print("\n② 写入收票信息")
     res = kd.link(a.fid, a.nos, formid=formid, replace=a.replace,
-                  with_serial=a.with_serial, allow_steal=a.allow_steal,
-                  allow_cross_org=a.allow_cross_org,
-                  allow_no_piaozone=a.allow_no_piaozone)
+                  with_serial=a.with_serial, allow_steal=a.allow_steal)
     print(f"   ✅ {res['written']}")
     time.sleep(2)
     print("\n③ 回读报销单")
@@ -923,19 +1272,23 @@ def main():
     s.add_argument("--with-serial", action="store_true", help="同时写发票云流水号 FIVSerialNo")
     s.add_argument("--allow-steal", action="store_true",
                    help="允许把已被其它单据关联的收票单抢过来（默认禁止）")
-    s.add_argument("--allow-cross-org", action="store_true",
-                   help="允许跨组织挂票（默认拦截：能写进去，但界面取不到发票云流水号、单据会变 D）")
-    s.add_argument("--allow-no-piaozone", action="store_true",
-                   help="允许挂没有发票云流水号的收票单（默认拦截：界面打开/补发票会报错）")
     s.set_defaults(fn=cmd_link)
 
     s = sub.add_parser("clear", help="清空报销单全部收票信息行")
     s.add_argument("fid")
     s.set_defaults(fn=cmd_clear)
 
-    s = sub.add_parser("precheck", help="提交前体检（状态/往来单位/发票金额）")
+    s = sub.add_parser("precheck", help="提交前体检（🔒 闸门本体：无票/无流水号/跨组织/金额，全部硬拦）")
     s.add_argument("fid")
     s.set_defaults(fn=cmd_precheck)
+
+    s = sub.add_parser("resolve", help="按发票号解析「该用哪张收票单」（同号多条时选权威票）")
+    s.add_argument("invoice_no", help="发票号码")
+    s.set_defaults(fn=cmd_resolve)
+
+    s = sub.add_parser("strict", help="严格模式探针：用 ValidateFlag=true 探测金蝶业务校验会不会拦")
+    s.add_argument("fid")
+    s.set_defaults(fn=cmd_strict)
 
     s = sub.add_parser("set-contact", help="补往来单位（官方规律=申请人本人）")
     s.add_argument("fid")
@@ -943,9 +1296,8 @@ def main():
     s.add_argument("--emp-id", type=int, help="改用员工内码")
     s.set_defaults(fn=cmd_set_contact)
 
-    s = sub.add_parser("submit", help="提交单据（先体检，有阻断项则中止）")
+    s = sub.add_parser("submit", help="提交单据（🔒 强制闸门：无票 / 无流水号 / 跨组织 / 金额，无绕过开关）")
     s.add_argument("fid")
-    s.add_argument("--force", action="store_true", help="忽略阻断项强提交")
     s.set_defaults(fn=cmd_submit)
 
     s = sub.add_parser("verify", help="一键自检：定位→写入→回读→联动校验")
@@ -954,8 +1306,6 @@ def main():
     s.add_argument("--replace", action="store_true")
     s.add_argument("--with-serial", action="store_true")
     s.add_argument("--allow-steal", action="store_true")
-    s.add_argument("--allow-cross-org", action="store_true")
-    s.add_argument("--allow-no-piaozone", action="store_true")
     s.set_defaults(fn=cmd_verify)
 
     # 让 --travel 写在子命令「前」或「后」都能生效

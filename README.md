@@ -13,7 +13,8 @@
 
 - 建费用申请单 / 出差申请单，并提交、下推报销单
 - 把发票挂进报销单的「**收票信息**」（纯金蝶 WebAPI，不需要发票云授权）
-- 发票不在收票池时，按发票原件**新建收票单**
+- 提交**硬闸门**：收票 0 行 / 缺发票云流水号 / 跨组织挂票 / 发票合计 < 报销金额 —— 命中即中止，**无绕过参数**
+- 发票不在收票池时，指引用**员工在报销软件里上传一次**拿到发票云流水号（手工建票已证伪，见下）
 - 让报销明细与发票一致（金额、费用项目对齐，写入「明细 ↔ 发票」联动关系）
 - 把**行程单**传成**附件**，避免与发票重复计入金额
 - 提交前体检：金额链条、收票信息、往来单位一次查清
@@ -99,7 +100,9 @@ python helpers/recvin_link.py find 24000000000000000001        # 按发票号码
 python helpers/recvin_link.py find SPD00000001                 # 按收票单号找
 ```
 
-查不到才新建收票单（`IV_ReceivedInvoice` 可以用标准 WebAPI 建）。
+查不到 → ⚠️ **不要手工建收票单**：手工建的票`FGENERATETYPE` 为空、**永远拿不到发票云流水号**，
+而 v2.0.11 起「无流水号」是**硬闸门**，这种票根本提交不过去。
+正确做法是**让员工在报销软件 / 发票云里把这张票上传一次**，当天进池、当天就有流水号。
 
 > ⚠️ **一张收票单只能属于一张报销单。** 把它挂到第二张单上会**静默改掉**原单的关联，
 > 造成「旧单还列着这张票、票却说属于别人」的不一致。工具默认拦截，确需改挂要显式加 `--allow-steal`。
@@ -143,7 +146,9 @@ python helpers/recvin_link.py precheck <报销单FID>
 python helpers/recvin_link.py submit <报销单FID>
 ```
 
-`submit` 会先体检，有阻断项会自动中止，不会盲提交。
+`submit` 会先跑硬闸门：**收票 0 行、缺发票云流水号、跨组织挂票、发票合计 < 报销金额** 命中任意一条
+都会**直接中止、不发起提交**，而且 **v2.0.11 起没有任何 `--force` 之类的绕过参数**。
+有阻断项时正确动作是**修数据**：`expense_edit.py fit` 把报销额调到发票合计，或让员工把缺的票补上传。
 
 ## 🧾 金额与费用类型口径
 
@@ -209,7 +214,7 @@ KingdeeExpenseFlow/
 │   └── piazzone_*.py            发票云兜底（可选，默认不需要）
 ├── references/
 │   ├── field_cookbook.md        字段级接口配方（实测）
-│   └── policy_rules.md          报销制度标准
+│   └── policy_rules.md          报销制度**模板**（全是【待填】空位；本公司规则请放 `references/policy_rules.local.md`，该文件不进仓库）
 └── 官方接口说明/                金蝶 WebAPI 原始文档
 ```
 
@@ -229,6 +234,22 @@ https://github.com/LittleBeaverStudio/KingdeeExpenseFlow
 
 能递归扫描 `SKILL.md` 的 SkillHub 或桌面管理器可以直接识别本仓库。若平台要求上传压缩包，请压缩整个仓库，并确认解压后根目录中仍有 `SKILL.md`。
 
+## 📋 报销制度：本 Skill 只管机制，制度请自己填
+
+各公司制度不一样（住宿限额、招待费审批、报销时限、税号……），所以**本 Skill 不内置任何具体制度**，
+`references/policy_rules.md` 是一份**全是【待填】空位的模板**。
+
+要接入贵司制度：
+
+```bash
+cp references/policy_rules.md references/policy_rules.local.md   # 然后按贵司规则填空
+```
+
+- `policy_rules.local.md` 已在 `.gitignore` / `.clawhubignore` 里，**不会进仓库、不会外泄**。
+- agent 会**优先读**它；读不到就只按通用口径处理，并且对【待填】的项**明确说"还没登记"，不会替你编一个限额**。
+- **只有两块是通用的**（与实现绑定，任何公司都适用）：① 金额与发票一致性口径（按发票金额调低报销额）；
+  ② 行程单必须传附件（防止与发票重复计入）。
+
 ## 🛠️ 常见问题
 
 ### 提示「发票金额不允许小于报销金额」
@@ -240,7 +261,7 @@ https://github.com/LittleBeaverStudio/KingdeeExpenseFlow
 
 ### `find` 查不到发票
 
-- 发票还没进收票池（数电票通常开票次日凌晨自动归集，纸票需先采集）；
+- 发票还没进收票池 —— ⚠️ **不要指望"系统会自动归集"**：金蝶后台的"下载发票"每次都要**电子税务局账号的手机验证码**，无法定时无人值守。**可靠做法是让员工在报销软件 / 发票云里把这张票上传一次**（当天进池、当天有流水号）；
 - 号码填错；
 - 该发票属于其它组织/账套；
 - 该票已被删除（删单会释放归属）。
@@ -268,7 +289,7 @@ helpers/recvin_link.py       收票信息写入 / 往来单位 / 体检 / 提交
 helpers/expense_edit.py      明细金额对齐 / 明细↔发票联动 / 附件上传（纯标准库）
 helpers/invoice_classifier.py 发票与行程单分类、字段提取、双算预警
 references/field_cookbook.md  字段与接口配方手册（全部为实测结论）
-references/policy_rules.md    差旅住宿/招待费等报销制度标准
+references/policy_rules.md    差旅住宿/招待费等报销制度**模板**（全是【待填】空位；本公司规则请放 `references/policy_rules.local.md`，该文件不进仓库）
 官方接口说明/                 金蝶 WebAPI 官方文档（Save / Submit / 收票单）
 ```
 
