@@ -138,6 +138,7 @@ Save 时必须加 `F` 前缀：
 - **更新分录用 `IsDeleteEntry="true"`**：不带 `FEntryID` 再 Save 一次会**追加**分录（2 行 → 4 行）；
   该开关只清分录、不动表头。
 - 收票单是**手工建**时 `FGENERATETYPE` 为 `" "`（空），自动归集的是 `3`/`4`。
+  🆕 但现在也可以建出 `3` —— **把发票云的真实验票流水号手填进去**即可，见 §3.5。
   ⚠️ **~~二者在报销单侧无差别~~ —— 这句是错的，2026-09-22 实测推翻**：
   手工建的票**拿不到发票云流水号**（`FPIAOZONESERIALNUMBER`/`FPDFURL`/`PICTUREURL` 全空，
   `ISEXAMINE=0`），而自动归集的票**全部有**（全池 1000 张有流水号 1000 张）。
@@ -171,6 +172,59 @@ Save 时必须加 `F` 前缀：
 ### 3.4 保存方式建议
 
 对已有收票单做修正时，建议**全量 Save**（`NeedUpDateFields: []`），把所有 header 字段 + 一条 `FEntity` 行完整传入，避免局部更新遗漏。
+
+---
+
+### 3.5 🆕 手填「真实流水号」= 服务端替代界面的「发票导入单据」（2026-10-10 实测）
+
+早前结论「手工建的票永远拿不到发票云流水号」，**前提是"这张票从没被发票云采集过"**。
+现在可以先把票送到发票云做**真实验票**，再把流水号手填进来：
+
+```bash
+python helpers/recvin_link.py create-recvin 发票.jpg --bill-fid <报销单FID> \
+       --org 101 --item-name "*交通运输服务*客运服务费" --link <报销单FID>
+```
+
+底层两步（都已实现在 `recvin_link.py`）：
+
+| 步骤 | 调用 | 实测结果 |
+|---|---|---|
+| ① 上传（真实验票） | `POST {发票云}/m4/fpzs/expense/upload?userKey=…`，multipart 字段固定 `file` | `0000 查验成功`，返回 33 位 `serialNo` + 发票号/金额/税额/购销方；**不需要 OCR 模型** |
+| ② 建票（手填流水号） | `Save IV_ReceivedInvoice`：扁平结构 + `FEntity` 明细行 + `FPIAOZONESERIALNUMBER` / `FGENERATETYPE=3` / `FISEXAMINE=1` | 写入成功、表头字段零丢失；回读一致 |
+
+**关键证据**：员工在界面上点「发票导入单据」生成的收票单，其 `FPIAOZONESERIALNUMBER`
+与服务端上传拿到的**逐字符一致** → 金蝶认的就是这个号，所以"手填"不是伪造
+（流水号来自真实验票通道，发票云 `expenseStatus` 照常锁票）。
+
+配套约束（都踩过）：
+- **`bxd_key`（报销单ID）必填**：传空时发票云回 `1200 getUserKey 失败：报销单ID不能为空`；
+- 发票云**不返回**发票明细项目名称 → `--item-name` 需由 agent 读发票图提供
+  （收票单必须带 `FEntity` 明细行，否则报销单校验读不到金额，见 §3.2）；
+- 建完**必须回读** `FPIAOZONESERIALNUMBER`（§3.3 的"静默丢字段"教训）。
+
+### 3.6 🆕 View 的读法：子表键名**不带 `F` 前缀**（2026-10-10 踩坑，务必记住）
+
+`View` 请求**必须带 `CreateOrgId` 与 `IsSortBySeq`**，否则返回对象里没有子表：
+
+```json
+{"FormId":"ER_ExpReimbursement","CreateOrgId":0,"Id":"101773","IsSortBySeq":"false"}
+```
+
+返回的子表**键名是"实体名"，不带 `F` 前缀** —— 用 `F` 前缀去取会得到 `None`，
+**极易误判成"单据体为空"**（本次实际误判过两次，还错怪了一张正常的申请单）：
+
+| 子表 | View 返回的键 | 用错的后果 |
+|---|---|---|
+| 报销明细 | **`ER_ExpenseReimbEntry`** | 查 `FEntity` → `None` |
+| 收票信息 | **`RecInvInfo`** | 查 `FRecInvInfo` → `None` |
+| 明细↔发票联动 | `FReimbAndRecInvInfo` | （这个是带 `F` 的，反例） |
+
+> 另一个反例：`View` 按 `Number` 查**无编号的草稿单**（`BillNo` 为空）会返回空对象 →
+> 必须用 `Id`（FID）查。
+>
+> 只想看明细金额时，更省事的是 `ExecuteBillQuery` **直接写单据体字段名**（`FExpenseAmount` 等），
+> 它返回"一行一条单据体"，不涉及上面这套键名（实测报销单单据体**没有 `FSeq`**，
+> 别拿它当去重键）。
 
 ---
 
@@ -301,7 +355,10 @@ FLINKBILLTYPE, FLINKBILLID, FLINKIVNUMBER, FPDFURL, FPIAOZONESERIALNUMBER, FDocu
 `helpers/piazzone_tool.py` 仍保留，但**不再是主路径**。仅在"发票不在收票池、需要程序化采集"时才有意义。
 其 `cache/save/status` 按官方文档原文只是「**告知发票云**单据与发票的绑定关系」（供发票助手端查询/状态跟踪），
 **本身不回写金蝶** —— 这也是当时"接口全返回 0000 但金蝶 0 行"的原因。
-出站网络注意：本环境网关按 SNI 拦 `api.piazzone.com`，同 IP 的 `api.piazzone.com` 可通（脚本已内置域名 failover）。
+出站网络注意：**唯一正确域名是 `api.piaozone.com`（piaozone，一个 z）**。
+早前写成 `api.piazzone.com` 导致 TLS 被重置，并被误判为"网关按 SNI 拦截 / 需要 IT 放行"
+—— 实际上该域名**根本不存在**（2026-10-10 定论，见 §3.5 与 `helpers/piazzone_tool.py` 顶部注释）。
+脚本保留域名 failover 仅作兜底，默认与推荐都用 `api.piaozone.com`。
 
 #### 已确认死路（不必再试）
 - `ER_ExpReimbursement` 的 18 个操作里**没有**"选择发票"类操作 → `ExecuteOperation` 调按钮不可行。
@@ -456,7 +513,7 @@ POST .../DynamicFormService.Submit.common.kdsvc
 > 注：本规则适用于金蝶原生上传 UI；若后续走发票云 piazzone API 自动化，需在 API 入参里对应设置"是否生成费用明细"标志，语义一致。
 ### 4.7 发票云 piazzone「发票助手 PC 端对接」— 服务端绑定发票↔报销单（真正解法）
 
-原生"选择发票"按钮坏掉不要紧：**发票云把该按钮的能力做成了标准 REST API**（发票云标准版，host `api.piazzone.com`）。agent 走这条即可在服务端把发票绑定到报销单并写入 `RecInvInfo`，**无需二开、无需客户端按钮**。
+原生"选择发票"按钮坏掉不要紧：**发票云把该按钮的能力做成了标准 REST API**（发票云标准版，host `api.piaozone.com`）。agent 走这条即可在服务端把发票绑定到报销单并写入 `RecInvInfo`，**无需二开、无需客户端按钮**。
 
 **认证**：`client_id` + `client_secret` + `timestamp` + `sign`；`sign = MD5|SHA256|HMACSHA256(client_id+client_secret+timestamp)`，`encType` 0/1/2（默认 2=HMACSHA256）。V3 接口请求参数**不需加密**（官方《对接约定》明写），无需 encrypt_key。凭证放本地 `helpers/piazzone_config.py`（复制 `piazzone_config.example.py` 后填写），或用 `PIAZZONE_*` 环境变量。
 
@@ -477,7 +534,9 @@ POST .../DynamicFormService.Submit.common.kdsvc
 
 **与金蝶侧的分工**：发票云负责"建收票单 + 绑定 + 写 RecInvInfo + 金额校验"；金蝶 WebAPI 负责"下推报销单 + 补 FCONTACTUNIT + Submit"。agent 串起两者即全自动闭环。
 
-**实时测试限制**：本执行沙箱无 `api.piazzone.com` 出站网络（DNS 不可达），无法在此跑活体；在能访问 piazzone 的环境运行 `helpers/piazzone_client.py`（已实现上述全部方法，签名自检通过）。
+**实时测试限制**：早前记录的"沙箱无 `api.piazzone.com` 出站网络（DNS 不可达）"是**误判** ——
+那个域名根本不存在（见 §3.5）。换成 `api.piaozone.com` 后**公网可直达**，
+`helpers/recvin_link.py upload / create-recvin` 已在本机实测跑通（2026-10-10）。
 
 
 ---

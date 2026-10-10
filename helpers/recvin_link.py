@@ -109,6 +109,8 @@ import re
 import sys
 import json
 import time
+import uuid
+import mimetypes
 import argparse
 import http.cookiejar
 import urllib.request
@@ -748,19 +750,134 @@ class Kingdee:
             reason = "无流水号且已被其它单据占用"
         return {"hit": hit, "all": ordered, "reason": reason}
 
+    # ── 发票云：服务端上传发票（拿真流水号）— 2026-10-10 新增 ──
+    @staticmethod
+    def _post_multipart(url, field_name, file_path, timeout=180):
+        """stdlib 版 multipart 上传（本模块坚持零第三方依赖）。"""
+        fname = os.path.basename(file_path)
+        ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        boundary = "----kdexpf" + uuid.uuid4().hex
+        with open(file_path, "rb") as fh:
+            content = fh.read()
+        head = ("--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+                "Content-Type: %s\r\n\r\n" % (boundary, field_name, fname, ctype))
+        body = head.encode("utf-8") + content + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST", headers={
+            "Content-Type": "multipart/form-data; boundary=%s" % boundary,
+            "Content-Length": str(len(body))})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def upload_invoice(self, file_path, bxd_key="", bill_no="", ghf_mc=None, timeout=180):
+        """把发票文件上传到**发票云**并做真实验票，返回识别结果（含 33 位流水号）。
+
+        这是「员工在金蝶里点『选择发票 → 上传 → 发票导入单据』」这一步的**服务端等价物**
+        （2026-10-10 实测打通）：
+
+            POST {API_BASE}/m4/fpzs/expense/upload?userKey=<uid>
+            multipart 字段名固定为 `file`
+
+        实测响应形态：
+        - 不带文件     → `A0706 用户上传文件为空`
+        - 带非发票文件 → `1999 识别异常`
+        - 带真发票     → `0000 查验成功`，data[0] 含 invoiceNo / invoiceAmount / taxAmount /
+          totalAmount / salerName / salerTaxNo / buyerTaxNo / serialNo(33位) / isRepeat / downloadUrl …
+
+        🔴 **必须走这条"真实验票通道"**：只有 `errcode=0000` 且 `serialNo` 非空，
+        才允许拿这个流水号去建收票单（见 `create_recv_invoice(serial_no=…)`）。
+        伪造或手工编号会绕开发票云的**防重**（`expenseStatus` 锁票）与**验真**，
+        正是 v2.0.11 提交硬闸门要拦的东西。
+
+        返回 dict：{ok, errcode, description, serial_no, invoice_no, amount, tax, total,
+                    seller, seller_tax, buyer_tax, is_repeat, pdf_url, raw}
+        """
+        empty = {"ok": False, "serial_no": "", "raw": {}}
+        try:
+            import piazzone_client as pz      # 延迟导入：未配发票云凭证时不拖累本模块其它命令
+        except SystemExit as e:                # piazzone_client 在无凭证时会 SystemExit
+            return dict(empty, errcode="NOCFG", description=str(e))
+        except Exception as e:                 # noqa: BLE001
+            return dict(empty, errcode="NOIMPORT", description=repr(e))
+
+        if not file_path or not os.path.exists(file_path):
+            return dict(empty, errcode="NOFILE", description="发票文件不存在：%s" % file_path)
+
+        if not str(bxd_key or "").strip():
+            # 实测：bxd_key 传空时发票云直接回 `1200 getUserKey 失败：报销单ID不能为空`
+            return dict(empty, errcode="NOBILL",
+                        description="发票云要求 bxd_key（报销单ID）非空 —— 请传 --bill-fid。"
+                                    "真实流程里这一步本来就发生在报销单上（界面「选择发票」），"
+                                    "所以先有报销单才能上传。")
+
+        uk_res = pz.get_user_key(bxd_key=str(bxd_key or ""),
+                                 ghf_mc=ghf_mc or getattr(pz, "GHF_MC", ""),
+                                 bill_number=str(bill_no or ""))
+        uk = ""
+        if isinstance(uk_res, dict):
+            uk = str((uk_res.get("data") or {}).get("userKey") or "")
+        if not uk:
+            return dict(empty,
+                        errcode=(uk_res or {}).get("errcode") if isinstance(uk_res, dict) else "?",
+                        description="getUserKey 失败：%s"
+                                    % (uk_res.get("description") if isinstance(uk_res, dict) else uk_res))
+
+        try:
+            resp = self._post_multipart("%s/m4/fpzs/expense/upload?userKey=%s" % (pz.API_BASE, uk),
+                                        "file", file_path, timeout=timeout)
+        except Exception as e:                 # noqa: BLE001
+            return dict(empty, errcode="NETWORK", description=repr(e))
+
+        items = resp.get("data") if isinstance(resp, dict) else None
+        item = items[0] if isinstance(items, list) and items else {}
+        if not isinstance(item, dict):
+            item = {}
+        serial = str(item.get("serialNo") or "")
+        return {
+            "ok": (str(resp.get("errcode")) == "0000") and bool(serial),
+            "errcode": resp.get("errcode"),
+            "description": resp.get("description"),
+            "serial_no": serial,
+            "invoice_no": item.get("invoiceNo") or "",
+            "amount": item.get("invoiceAmount"),
+            "tax": item.get("taxAmount"),
+            "total": item.get("totalAmount"),
+            "seller": item.get("salerName") or "",
+            "seller_tax": item.get("salerTaxNo") or "",
+            "buyer_tax": item.get("buyerTaxNo") or "",
+            "is_repeat": item.get("isRepeat"),
+            "tax_rate": _pct(item.get("taxRate")),
+            "item_name": item.get("itemName") or item.get("goodsName") or "",
+            "pdf_url": item.get("downloadUrl") or "",
+            "raw": resp,
+        }
+
     def create_recv_invoice(self, invoice_no, amount, tax_amount=0.0, open_date=None,
                             seller_name="", seller_tax="", buyer_name="", buyer_tax="",
                             org_no="101", inv_type="26", item_name="", tax_rate=0.0,
-                            settle_org_no=None, check_dup=True, remark=""):
+                            settle_org_no=None, check_dup=True, remark="",
+                            serial_no=None, pdf_url="", generate_type=None):
         """手工建一张收票单。返回 `(bill_no, fid, created:bool, note)`。
 
         🔴 **默认查重**（`check_dup=True`）：金蝶**不校验发票号重复**（实测同号能建第二张、
         静默污染收票池），所以这里先 `resolve_authoritative()`，已存在就**直接返回那张**，
         不再新建 —— 这是防重与防污染的**唯一防线**。
 
-        🔴 **手工建的票永远拿不到发票云流水号**（`GENERATETYPE=' '`、
-        `FPIAOZONESERIALNUMBER=' '`、`ISEXAMINE='0'`）：挂到同组织报销单**不补**，
+        ── 流水号：旧结论 + 2026-10-10 的重要更新 ──
+        🔴 **旧结论**：手工建的票拿不到发票云流水号（`GENERATETYPE=' '`、
+        `FPIAOZONESERIALNUMBER=' '`、`ISEXAMINE='0'`）—— 挂到同组织报销单**不补**，
         事后从电子税务局重新下载**也不补**（2026-09-22 用户实测）。
+        但它的前提是"**这张票从没被发票云采集过**"。
+
+        ✅ **2026-10-10 更新：可以先把票送到发票云做真实验票，再把流水号手填进来**：
+          1) `upload_invoice(<发票文件>)` → 拿到 33 位 `serialNo`（响应 `查验成功`）
+          2) `create_recv_invoice(..., serial_no=<serialNo>, pdf_url=<downloadUrl>, generate_type="3")`
+        实测：这样建出的票 `FPIAOZONESERIALNUMBER` / `FGENERATETYPE=3` / `FISEXAMINE=1`
+        全部写入成功、表头字段零丢失；随后 `link` 挂单、`precheck` 与 `strict`
+        （ValidateFlag=true）**均通过** → **这一步等价于金蝶界面上的「发票导入单据」，
+        但不需要人工点击**（界面动作没有可调 API，见 `references/field_cookbook.md` §4.2）。
+
+        🔴 仍然**不要**"凭空手填一个编号"：那才是 v2.0.11 硬闸门要拦的假流水号票。
+        判据很简单 —— **这个 serialNo 是不是 `upload_invoice()` 给的真实验票号**。
         ⛔ 曾经据 `SPD00008775`「09-21 无号 → 09-22 16:14 有号」推断的"挂单后异步补号"
         **已作废** —— 复核发现它是**被发票云重新采集覆盖**（`GENERATETYPE` 由 `' '` 变 `'3'`
         并出现 `FPDFURL`），不是回填。
@@ -790,6 +907,13 @@ class Kingdee:
             "FSOURCEORGID": {"FNumber": str(org_no)},
             "FSETTLEORGID": {"FNumber": str(settle_org_no or org_no)},
         }
+        # ★ 真实流水号三件套：只有从 upload_invoice() 拿到的号才允许这样写（2026-10-10 实测通过）
+        if serial_no:
+            model["FPIAOZONESERIALNUMBER"] = str(serial_no)
+            model["FGENERATETYPE"] = str(generate_type or "3")
+            model["FISEXAMINE"] = "1"
+            if pdf_url:
+                model["FPDFURL"] = str(pdf_url)
         if item_name:
             model["FEntity"] = [{
                 "FITEMNAME": item_name, "FUNIT": "", "FSPECIFICATIONS": "",
@@ -1039,6 +1163,19 @@ class Kingdee:
                 "errors": msgs, "strict_errors": inv_err}
 
     # ────────────────────────── 命令 ──────────────────────────
+def _pct(v):
+    """把发票云返回的税率统一成「百分数数值」。
+
+    实测发票云 `taxRate` 形如 `"0.030000"`（小数），而金蝶收票单要百分数 `3.0`，
+    所以 0<x≤1 时乘 100。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(f * 100, 6) if 0 < f <= 1 else round(f, 6)
+
+
 def _fmt_inv(hit):
     return (f"{hit['bill_no']:16s} 发票号={hit['invoice_no']:24s} "
             f"价税合计={hit['amount']:<10} 开票日={str(hit['open_date'])[:10]} "
@@ -1251,6 +1388,121 @@ def cmd_verify(kd, a):
     return 0 if ok else 1
 
 
+def cmd_upload(kd, a):
+    """把发票文件上传到发票云，拿真流水号（**只读发票云，不写金蝶任何数据**）。"""
+    res = kd.upload_invoice(a.file, bxd_key=getattr(a, "bill_fid", "") or "",
+                            bill_no=getattr(a, "bill_no", "") or "")
+    print("上传发票 → 发票云")
+    print("  文件 : %s" % a.file)
+    print("  结果 : errcode=%s  %s" % (res.get("errcode"), res.get("description")))
+    if not res.get("ok"):
+        ec = res.get("errcode")
+        if ec == "NOCFG":
+            print("  ⚠️ 未配置发票云凭证：复制 helpers/piazzone_config.example.py 为 "
+                  "piazzone_config.py 填写，或设 PIAZZONE_* 环境变量")
+        elif ec == "1999":
+            print("  ⚠️ 识别异常：换更清晰的原件（XML/PDF 优于拍照件）")
+        elif ec == "A0706":
+            print("  ⚠️ 上传文件为空（字段名/文件读取有问题）")
+        print("  ❌ 未拿到流水号 → 不可用于建票")
+        return 2
+    print("  ✅ 查验成功（真实验票通道）")
+    for k, label in (("invoice_no", "发票号码"), ("total", "价税合计"), ("amount", "不含税"),
+                     ("tax", "税额"), ("tax_rate", "税率%"), ("seller", "销方"),
+                     ("seller_tax", "销方税号"), ("buyer_tax", "购方税号"),
+                     ("is_repeat", "是否重复"), ("serial_no", "发票云流水号"),
+                     ("pdf_url", "原件URL")):
+        print("  %-12s: %s" % (label, res.get(k)))
+    print("")
+    print("  下一步拿这个流水号建收票单（= 界面的「发票导入单据」）：")
+    print("    python helpers/recvin_link.py create-recvin \"%s\" --org 101 "
+          "--item-name \"<发票项目名>\"%s"
+          % (a.file, (" --link %s" % a.bill_fid) if getattr(a, "bill_fid", "") else ""))
+    return 0
+
+
+def cmd_create_recvin(kd, a):
+    """上传发票 → 用**真流水号**建收票单 → 回读核对 →（可选）挂到报销单。
+
+    等价于金蝶界面上的「选择发票 → 上传 → 发票导入单据」，但全程无需人工点击。
+    🔒 硬约束：流水号必须来自真实验票通道；拿不到就**拒绝建票**（不凭空手填编号）。
+    """
+    print("=" * 68)
+    print("① 上传发票到发票云（真实验票）")
+    up = kd.upload_invoice(a.file, bxd_key=getattr(a, "bill_fid", "") or "",
+                           bill_no=getattr(a, "bill_no", "") or "")
+    print("   errcode=%s  %s" % (up.get("errcode"), up.get("description")))
+    if not up.get("ok"):
+        if up.get("errcode") == "NOCFG":
+            print("   ⚠️ 未配置发票云凭证（helpers/piazzone_config.py 或 PIAZZONE_* 环境变量）")
+        print("   ❌ 没拿到真流水号 → **拒绝建票**（凭空手填编号正是硬闸门要拦的票）")
+        return 2
+    serial = up["serial_no"]
+    print("   ✅ 查验成功  serialNo=%s" % serial)
+    print("   发票号=%s | 价税合计=%s（税 %s，税率 %s%%）| 销方=%s"
+          % (up.get("invoice_no"), up.get("total"), up.get("tax"),
+             up.get("tax_rate"), up.get("seller")))
+
+    if not a.item_name:
+        print("")
+        print("⚠️ 发票云**不返回**发票明细项目名称，但收票单必须带明细行"
+              "（否则报销单校验读不到金额）。")
+        print("   请用 --item-name 提供（agent 读发票图即可得到），例如：")
+        print("     --item-name \"*交通运输服务*客运服务费\"")
+        return 3
+
+    print("=" * 68)
+    print("② 建收票单（扁平结构 + 明细行 + 手填真实流水号）")
+    buyer_name = a.buyer_name or ""
+    if not buyer_name:
+        try:
+            import piazzone_client as _pz
+            buyer_name = getattr(_pz, "GHF_MC", "") or ""
+        except Exception:                       # noqa: BLE001
+            buyer_name = ""
+    bill_no, fid, created, note = kd.create_recv_invoice(
+        invoice_no=up.get("invoice_no"),
+        amount=float(up.get("total") or 0),
+        tax_amount=float(up.get("tax") or 0),
+        open_date=(a.open_date or time.strftime("%Y-%m-%d")),
+        seller_name=up.get("seller") or "",
+        seller_tax=up.get("seller_tax") or "",
+        buyer_name=buyer_name,
+        buyer_tax=up.get("buyer_tax") or "",
+        org_no=str(a.org), item_name=a.item_name,
+        tax_rate=float(up.get("tax_rate") or 0),
+        serial_no=serial, pdf_url=up.get("pdf_url") or "")
+    print("   %s %s（%s）" % ("新建" if created else "复用", bill_no, note))
+    if not bill_no:
+        return 4
+
+    print("=" * 68)
+    print("③ 回读核对（Save 返回 IsSuccess 也可能静默丢字段，必须回读）")
+    keys = ("FBillNo", "FIVNUMBER", "FPIAOZONESERIALNUMBER", "FGENERATETYPE", "FISEXAMINE",
+            "FSUMALLAMOUNT", "FLINKBILLID")
+    rows = kd.query(FORM_RECV_INV, ",".join(keys), "FBillNo='%s'" % bill_no, top=3)
+    if not rows:
+        print("   ❌ 回读不到刚建的收票单，请人工核验")
+        return 5
+    got = dict(zip(keys, rows[0]))
+    for k in keys:
+        print("   %-24s = %s" % (k, got.get(k)))
+    if str(got.get("FPIAOZONESERIALNUMBER") or "").strip() != serial:
+        print("   🔴 流水号没写落库！先别挂单 —— 核对字段名是否随金蝶版本变化")
+        return 5
+    print("   ✅ 流水号已落库")
+
+    if getattr(a, "link", None):
+        print("=" * 68)
+        print("④ 挂到报销单 %s" % a.link)
+        res = kd.link(a.link, [bill_no],
+                      formid=(FORM_TRAVEL if getattr(a, "travel", False) else FORM_EXPENSE))
+        print("   ✅ 已挂 %d 行（跳过 %d）"
+              % (len(res.get("written") or []), len(res.get("skipped") or [])))
+        print("   下一步：precheck →（按金额口径调整）→ submit")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="报销单「收票信息」写入（纯金蝶 WebAPI）")
     p.add_argument("--travel", action="store_true", help="操作差旅费报销单 ER_ExpReimbursement_Travel")
@@ -1307,6 +1559,30 @@ def main():
     s.add_argument("--with-serial", action="store_true")
     s.add_argument("--allow-steal", action="store_true")
     s.set_defaults(fn=cmd_verify)
+
+    s = sub.add_parser("upload",
+                       help="把发票文件上传到发票云，拿真流水号（不写金蝶任何数据）")
+    s.add_argument("file", help="发票文件路径（XML/PDF/图片）")
+    s.add_argument("--bill-fid", required=True,
+                   help="报销单 FID（**必填**：发票云要求报销单ID非空）")
+    s.add_argument("--bill-no", help="报销单编号（可选）")
+    s.set_defaults(fn=cmd_upload)
+
+    s = sub.add_parser("create-recvin",
+                       help="上传发票→用真流水号建收票单→回读核对→(可选)挂单"
+                            "（= 金蝶界面的「发票导入单据」，但无人工点击）")
+    s.add_argument("file", help="发票文件路径")
+    s.add_argument("--bill-fid", required=True,
+                   help="报销单 FID（**必填**：发票云要求报销单ID非空）")
+    s.add_argument("--org", default="101", help="来源/结算组织编号（默认 101）")
+    s.add_argument("--item-name", default="",
+                   help="发票明细项目名称（发票云不返回，必填；如 '*交通运输服务*客运服务费'）")
+    s.add_argument("--open-date", default="", help="开票日期 YYYY-MM-DD（留空=今天）")
+    s.add_argument("--buyer-name", default="",
+                   help="购方名称（默认取发票云配置的 ghf_mc）")
+    s.add_argument("--bill-no", help="报销单编号（可选）")
+    s.add_argument("--link", metavar="报销单FID", help="建好后直接挂到该报销单的收票信息")
+    s.set_defaults(fn=cmd_create_recvin)
 
     # 让 --travel 写在子命令「前」或「后」都能生效
     # （default=SUPPRESS：子命令未显式给出时不覆盖顶层已解析的值）

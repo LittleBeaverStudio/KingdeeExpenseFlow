@@ -8,7 +8,7 @@
 # 凭证来源（按优先级，均无需改本代码）：
 #   1) 环境变量（单公司最快接入，零文件）：
 #        PIAZZONE_CLIENT_ID / PIAZZONE_CLIENT_SECRET / PIAZZONE_TAX_NO / PIAZZONE_GHF_MC
-#        PIAZZONE_BASE_URL（可选，默认 https://api.piazzone.com）
+#        PIAZZONE_BASE_URL（可选，默认 https://api.piaozone.com）
 #   2) 同目录 piazzone_companies.json 中 --company <key> 对应条目（多公司集中管理）
 #   3) 内置示例 example-a / example-b / dev（仅演示，可删）
 #
@@ -24,12 +24,16 @@
 #   BizOut = 智能对公单据
 # --bill-type-id：仅当贵司金蝶金税互联配置需特定金蝶单据类型ID（如 FYBX/CLF）时追加，默认不传。
 #
-# ─── 域名可达性（2026-09-14 实测，重要）───
-# 生产同一台服务器 IP 52.83.114.130 上有两个域名拼写：
-#     https://api.piazzone.com   ← 官方环境文档给的，部分企业网关按 SNI 拦截（TLS WRONG_VERSION_NUMBER）
-#     https://api.piaozone.com   ← 同一 IP，实测可通，接口行为一致
-# 因此本脚本默认用 api.piaozone.com，并内置「域名 failover」：一个不通自动换另一个。
-# 无需 hosts 绑定、无需 IT 放行。如两域名都不通，才需网络放行 *.piazzone.com:443 / *.piaozone.com:443。
+# ─── 域名（2026-10-10 定论）───
+# 正确域名只有一个：**https://api.piaozone.com**（piaozone，一个 z）。
+#     https://api.piaozone.com   ← ✅ 正确，实测通；官方 PC 客户端（发票智慧管家）
+#                                   内部全篇使用它（api / api-dev / api-sit / img / link 等子域）
+#     https://api.piazzone.com   ← ❌ 拼写错误，该域名**不存在**。表现为 TLS 被重置
+#                                   （曾误判为"TLS 墙 / 需 IT 放行 / 有 IP 白名单"）
+# ⚠️ 早前结论「两个域名都能用、按 SNI 拦截」不成立：piazzone 通不了是域名拼错，不是网关拦。
+#    手动绑 hosts 会掩盖问题（TCP 能连但 SNI 对不上，照样被掐）。
+# 本脚本仍保留域名 failover 作为兜底，但**默认与推荐都用 api.piaozone.com**；
+# 两域名都不通时，才需网络放行 *.piaozone.com:443。
 # 测试环境 https://api-dev.piaozone.com/test 也可直接连。
 # 签名：MD5(encType=0)，官方指定（MD5(client_id + client_secret + timestamp)）。
 
@@ -75,7 +79,8 @@ BILL_TYPES = {
 TICKET_PARAM_DEFAULT = "00001"
 
 
-# 域名候选（failover 顺序）：实测 api.piaozone.com 可通、api.piazzone.com 常被网关按 SNI 拦截
+# 域名候选（failover 顺序）：api.piaozone.com 是唯一正确域名；
+# api.piazzone.com 仅为历史拼写保留在末尾兜底（它**不存在**，正常情况永远不该命中）
 DEFAULT_HOSTS = ["https://api.piaozone.com", "https://api.piazzone.com"]
 
 

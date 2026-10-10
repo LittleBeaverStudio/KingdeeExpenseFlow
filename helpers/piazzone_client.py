@@ -45,7 +45,7 @@ except ImportError:                                    # 没有本地配置就�
     CLIENT_ID = os.environ.get("PIAZZONE_CLIENT_ID", "")
     CLIENT_SECRET = os.environ.get("PIAZZONE_CLIENT_SECRET", "")
     GHF_MC = os.environ.get("PIAZZONE_GHF_MC", "")
-    API_BASE = os.environ.get("PIAZZONE_BASE_URL", "https://api.piazzone.com")
+    API_BASE = os.environ.get("PIAZZONE_BASE_URL", "https://api.piaozone.com")
     ENC_TYPE = int(os.environ.get("PIAZZONE_ENC_TYPE", "0"))
 
 if not CLIENT_ID or CLIENT_ID.startswith("请填"):
@@ -85,8 +85,17 @@ def _post(path: str, body: dict, *, timeout: int = 30, retries: int = 3) -> dict
         except Exception as e:
             last = e
             if i < retries - 1:
-                time.sleep(1.0)  # 生产 IP TLS 间歇被拦，重试可能命中可用后端
-    return {"errcode": "NETWORK", "description": repr(last)}
+                time.sleep(1.0)
+    # ⚠️ 排错提示：这个模块曾经因为 base_url 拼写错误（api.piazzone.com，多一个 z）
+    #    被误判成"TLS 墙 / 需要 IT 放行"，白查了两个月。若这里报 SSL/EOF 类错误，
+    #    第一件事就是核对域名拼写：正确是 **api.piaozone.com**（piaozone，一个 z）。
+    msg = repr(last)
+    if any(k in msg for k in ("SSL", "EOF", "WRONG_VERSION", "CERTIFICATE", "Connection reset")):
+        msg += ("\n      ↳ 若为 SSL/TLS 类失败，先核对 API_BASE 域名拼写："
+                "正确为 https://api.piaozone.com（piaozone 一个 z）。"
+                "写成 piazzone（两个 z）会 TLS 失败，且该域名根本不存在，"
+                "手动绑 hosts 也无效（SNI 对不上）。")
+    return {"errcode": "NETWORK", "description": msg}
 
 
 def _get(path: str, *, timeout: int = 30, retries: int = 3) -> dict:

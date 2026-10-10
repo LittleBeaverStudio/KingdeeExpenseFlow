@@ -12,7 +12,8 @@ ACTIVE_ENV = "prod"
 
 ENV = {
     "prod": {
-        "base_url": "https://api.piazzone.com",
+        # ✅ 正确域名：piaozone（一个 z）。写成 piazzone（两个 z）会 TLS 失败。
+        "base_url": "https://api.piaozone.com",
         "tax_no": "请填写购方统一社会信用代码",
         "ghf_mc": "请填写购方企业全称",
         "client_id": "请填写你的client_id",
