@@ -33,27 +33,199 @@ import urllib.request
 import urllib.error
 import ssl
 
-# 凭证来源优先级：环境变量 > piazzone_config.py（本地，不进 git）
-# ⚠️ 公开仓库里没有 piazzone_config.py，请复制 piazzone_config.example.py 后填写，
-#    或直接设环境变量 PIAZZONE_CLIENT_ID / PIAZZONE_CLIENT_SECRET / PIAZZONE_TAX_NO / PIAZZONE_GHF_MC
+# 凭证来源优先级：环境变量 > **系统加密凭据（DPAPI）** > piazzone_config.py（本地，不进 git）
+# ⚠️ 公开仓库里没有 piazzone_config.py。推荐用配置向导填写：
+#      python helpers/setup_credentials.py   → 「可选：发票云」一组字段
+#    凭据经 Windows 系统加密保存，明文不落盘、不进对话记录。
+_CFG = {"TAX_NO": "", "CLIENT_ID": "", "CLIENT_SECRET": "", "ENCRYPT_KEY": "",
+        "GHF_MC": "", "API_BASE": "https://api.piaozone.com", "ENC_TYPE": 0}
+
+# ① 本地明文配置（最低优先级，兜底）。用 getattr 逐个取，缺某个常量也不至于整块失效。
 try:
-    from piazzone_config import (
-        TAX_NO, CLIENT_ID, CLIENT_SECRET, ENC_TYPE, API_BASE, GHF_MC,
-    )
-except ImportError:                                    # 没有本地配置就走环境变量
-    TAX_NO = os.environ.get("PIAZZONE_TAX_NO", "")
-    CLIENT_ID = os.environ.get("PIAZZONE_CLIENT_ID", "")
-    CLIENT_SECRET = os.environ.get("PIAZZONE_CLIENT_SECRET", "")
-    GHF_MC = os.environ.get("PIAZZONE_GHF_MC", "")
-    API_BASE = os.environ.get("PIAZZONE_BASE_URL", "https://api.piaozone.com")
-    ENC_TYPE = int(os.environ.get("PIAZZONE_ENC_TYPE", "0"))
+    import piazzone_config as _pc  # type: ignore
+    _CFG["TAX_NO"] = getattr(_pc, "TAX_NO", "") or ""
+    _CFG["CLIENT_ID"] = getattr(_pc, "CLIENT_ID", "") or ""
+    _CFG["CLIENT_SECRET"] = getattr(_pc, "CLIENT_SECRET", "") or ""
+    _CFG["ENCRYPT_KEY"] = getattr(_pc, "ENCRYPT_KEY", "") or ""
+    _CFG["GHF_MC"] = getattr(_pc, "GHF_MC", "") or ""
+    _CFG["API_BASE"] = getattr(_pc, "API_BASE", "") or _CFG["API_BASE"]
+    _CFG["ENC_TYPE"] = int(getattr(_pc, "ENC_TYPE", 0) or 0)
+except Exception:  # noqa: BLE001  （没有本地配置很正常）
+    pass
+
+# ② 系统加密凭据（推荐）。**支持多组织**。
+# ⚠️ 向导/加密存储里用的是**小写键**（client_id / client_secret / …），
+#    本模块内部用大写，必须显式映射 —— 直接按同名取会永远取不到（实测踩过）。
+PIAZZONE_ORG_USED = ""          # 本次实际选用的组织，便于排障（只读）
+
+
+def _split_orgs(raw) -> list:
+    """「对应金蝶组织」字段 → 编码列表。逗号 / 顿号 / 空格分隔都认。"""
+    return [c.strip() for c in
+            str(raw or "").replace("，", ",").replace("、", ",").replace(" ", ",").split(",")
+            if c.strip()]
+
+
+def _load_raw_piazzone():
+    """读加密存储里的 `piazzone` 段（读不到返回 None）。"""
+    try:
+        import credstore as _cs  # 同目录，纯标准库
+        return (_cs.load() or {}).get("piazzone") if _cs.available() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _normalize_orgs(pz) -> dict:
+    """归一成 `{组织名: 条目}`；兼容旧的**扁平单组织**结构。"""
+    if not isinstance(pz, dict) or not pz:
+        return {}
+    if not isinstance(pz.get("orgs"), dict):                 # 旧扁平结构
+        return {"(默认)": pz} if pz.get("client_id") else {}
+    return {k: v for k, v in pz["orgs"].items()
+            if isinstance(v, dict) and v.get("client_id")}
+
+
+def _pick_piazzone_org(pz: dict, kingdee_org: str = "", want_org: str = "",
+                       org_name: str = "") -> tuple[dict, str, str]:
+    """从加密存储的 `piazzone` 段里挑出本次要用的组织。
+
+    选择顺序：`want_org` / `PIAZZONE_ORG`（按组织名 / 税号 / 企业全称匹配）
+              > `kingdee_org` / `KINGDEE_ORG`（按登记的「金蝶组织编码」匹配）
+              > `org_name`（**按金蝶组织名称 ↔ 购方企业全称自动匹配**，界面不需要人工维护）
+              > 存储里的 `active` > 第一个组织。
+
+    返回 `(条目, 组织名, 命中方式)`；命中方式 ∈ name / kingdee / orgname / active / first。
+    兼容旧的**扁平单组织**结构。
+    """
+    orgs = _normalize_orgs(pz)
+    if not orgs:
+        return {}, "", ""
+    want = (want_org or os.environ.get("PIAZZONE_ORG") or "").strip()
+    if want:
+        for k, v in orgs.items():
+            if want in (k, str(v.get("ghf_mc") or ""), str(v.get("tax_no") or "")):
+                return v, k, "name"
+    kd = (kingdee_org or os.environ.get("KINGDEE_ORG") or "").strip()
+    if kd:
+        for k, v in orgs.items():
+            if kd in _split_orgs(v.get("kingdee_orgs")):
+                return v, k, "kingdee"
+    nm = str(org_name or "").strip()
+    if len(nm) >= 4:                       # 太短的名字不做模糊匹配，免得误命中
+        for k, v in orgs.items():
+            if nm in (k, str(v.get("ghf_mc") or "")):
+                return v, k, "orgname"
+        for k, v in orgs.items():          # 宽松一轮：金蝶组织名可能是简称/带后缀
+            g = str(v.get("ghf_mc") or "").strip() or k
+            if g and (nm in g or g in nm):
+                return v, k, "orgname"
+    act = str(pz.get("active") or "")
+    if act in orgs:
+        return orgs[act], act, "active"
+    k = next(iter(orgs))
+    return orgs[k], k, "first"
+
+
+def list_piazzone_orgs() -> list:
+    """列出加密存储里已配置的组织名（供排障 / 智能体提示用）。"""
+    return list(_normalize_orgs(_load_raw_piazzone()).keys())
+
+
+def describe_piazzone_orgs() -> list:
+    """`[(组织名, 购方企业全称, 购方税号, 对应金蝶组织)]` —— 用于确认「到底配了哪几家」。"""
+    return [(k, str(v.get("ghf_mc") or ""), str(v.get("tax_no") or ""),
+             str(v.get("kingdee_orgs") or ""))
+            for k, v in _normalize_orgs(_load_raw_piazzone()).items()]
+
+
+# ③ 环境变量（最高优先级，适合 CI / 无人值守）
+_ENV_OVERRIDES: dict = {}
+for _env, _key, _cast in (("PIAZZONE_TAX_NO", "TAX_NO", str),
+                          ("PIAZZONE_CLIENT_ID", "CLIENT_ID", str),
+                          ("PIAZZONE_CLIENT_SECRET", "CLIENT_SECRET", str),
+                          ("PIAZZONE_GHF_MC", "GHF_MC", str),
+                          ("PIAZZONE_BASE_URL", "API_BASE", str),
+                          ("PIAZZONE_ENC_TYPE", "ENC_TYPE", int)):
+    _v = os.environ.get(_env)
+    if _v not in (None, ""):
+        _ENV_OVERRIDES[_key] = _cast(_v)
+
+_BASE_CFG = dict(_CFG)          # 基准值 = 本地明文配置（最低优先级）
+
+
+def _apply_org(org: dict) -> None:
+    """把组织条目的值叠加到基准值、再叠加环境变量，写入模块级常量。
+
+    ⚠️ 环境变量永远最高优先 —— 显式设了 `PIAZZONE_CLIENT_ID` 之类的，
+    即使随后调 `select_org()` 切组织也不会被覆盖。
+    """
+    global TAX_NO, CLIENT_ID, CLIENT_SECRET, ENCRYPT_KEY, GHF_MC, API_BASE, ENC_TYPE
+    eff = dict(_BASE_CFG)
+    for _k, _pk in (("CLIENT_ID", "client_id"), ("CLIENT_SECRET", "client_secret"),
+                    ("ENCRYPT_KEY", "encrypt_key"), ("TAX_NO", "tax_no"),
+                    ("GHF_MC", "ghf_mc"), ("API_BASE", "base_url")):
+        _val = (org or {}).get(_pk)
+        if _val not in (None, ""):
+            eff[_k] = _val
+    if (org or {}).get("enc_type") not in (None, ""):
+        eff["ENC_TYPE"] = int(org["enc_type"])
+    eff.update(_ENV_OVERRIDES)
+    TAX_NO = eff["TAX_NO"]
+    CLIENT_ID = eff["CLIENT_ID"]
+    CLIENT_SECRET = eff["CLIENT_SECRET"]
+    ENCRYPT_KEY = eff["ENCRYPT_KEY"]
+    GHF_MC = eff["GHF_MC"]
+    API_BASE = eff["API_BASE"]
+    ENC_TYPE = eff["ENC_TYPE"]
+
+
+def select_org(kingdee_org: str = "", org: str = "", org_name: str = "") -> dict:
+    """**按金蝶组织切换本次使用的发票云企业授权**（多收票组织的关键）。
+
+    发票云的权益是**按税号维度**划分的：每个购买了收票服务的税号，各有一组
+    `client_id / client_secret / 购方税号`（官方原文：「请使用税号对应的企业授权，
+    不要用租户授权」）。所以同一账套下 101 / 104 两家都开了收票时，必须按单据的
+    **金蝶组织**选用对应的那一组 —— 用错组织会带上错误的购方税号，上传与建票都白做。
+
+    三种指定方式（任选其一即可，越靠前优先级越高）::
+
+        piazzone_client.select_org(kingdee_org="104")            # 金蝶组织编码
+        piazzone_client.select_org(org_name="北京卓美医联科技有限公司")  # 金蝶组织名称（**推荐**）
+        piazzone_client.select_org(org="北京卓美医联科技有限公司")      # 组织名/税号/企业全称
+
+    `org_name` 是与**购方企业全称**比对 —— 界面上不需要再单独维护「组织名」或
+    「对应金蝶组织」，配了几家就按公司名自动对上（`recvin_link.upload_invoice`
+    会自动从报销单里读出组织名称再调这里）。
+
+    返回 `{"name": 选中的组织名, "matched": 命中方式, "candidates": [全部组织名]}`。
+    命中方式 ∈ name / kingdee / orgname / active / first。
+    ⚠️ `candidates` 多于一个、而 `matched` 落到 **active/first**，说明该组织
+    没对上任何一家 —— 调用方应停下来提示用户核对，**不要**拿另一家的授权硬跑。
+    """
+    global PIAZZONE_ORG_USED
+    pz = _load_raw_piazzone()
+    picked, name, how = _pick_piazzone_org(pz, kingdee_org=kingdee_org, want_org=org,
+                                           org_name=org_name)
+    if picked:
+        _apply_org(picked)
+        PIAZZONE_ORG_USED = name
+    return {"name": PIAZZONE_ORG_USED, "matched": how,
+            "candidates": list(_normalize_orgs(pz).keys())}
+
+
+_picked, PIAZZONE_ORG_USED, _PICK_HOW = _pick_piazzone_org(_load_raw_piazzone())
+_apply_org(_picked)
 
 if not CLIENT_ID or CLIENT_ID.startswith("请填"):
     raise SystemExit(
-        "❌ 未配置发票云凭证。\n"
-        "   方式一（推荐）：复制 helpers/piazzone_config.example.py 为 helpers/piazzone_config.py 并填写；\n"
+        "❌ 未配置发票云凭证（本模块是**可选**功能）。\n"
+        "   方式一（推荐）：运行配置向导，填「可选：发票云」那一组\n"
+        "       python helpers/setup_credentials.py\n"
+        "       （凭据经 Windows 系统加密保存，明文不落盘、不进对话）\n"
         "   方式二：设环境变量 PIAZZONE_CLIENT_ID / PIAZZONE_CLIENT_SECRET / PIAZZONE_TAX_NO / PIAZZONE_GHF_MC\n"
-        "   注意：金蝶报销主链路（收票信息写入）**不需要**发票云凭证，本模块只是可选兜底。")
+        "   方式三：复制 helpers/piazzone_config.example.py 为 helpers/piazzone_config.py 并填写（明文，不推荐）\n"
+        "   ⚠️ 凭据请向「发票云（票总管）」客服索取，或登录 open-ultimate.piaozone.com 查看。\n"
+        "   注意：金蝶报销主链路（收票信息写入 / 明细对齐 / 附件 / 提交）**不需要**发票云凭证。")
 
 
 # ───────────────────────── 签名（官方：MD5 encType=0） ─────────────────────────

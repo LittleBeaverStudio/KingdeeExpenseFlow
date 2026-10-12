@@ -32,27 +32,43 @@
 python --version   # 需要 3.8 或更高
 ```
 
-### 2. 连接配置：通常不需要你做任何事
+### 2. 连接配置：推荐用配置向导（明文不落盘）
 
-本 Skill **不单独保存账号密码**，也没有独立的配置项。只要机器上装好并配置过
+本 Skill 与本工作室的其它金蝶技能**共用同一份连接配置**。推荐用向导填一次：
+
+```bash
+python helpers/setup_credentials.py
+```
+
+弹窗里**只需填 3 项：公司名（账套名称）、用户名、密码**。凭据用 **Windows 系统加密（DPAPI）**
+保存到 `~/.workbuddy/kingdee/credentials.bin`：
+
+- 🔒 绑当前 Windows 用户 —— 同机其它用户读不出，拷到别的机器也解不开
+- 🔒 不写明文文件、不进对话记录、不落日志（向导只回报字段名是否存在，永不回显值）
+- 🔒 在技能目录之外，升级 / 重装 / 打包都不会带上它
+
+只看状态、不开窗：`python helpers/setup_credentials.py --check`
+
+如果已经装好并配置过
 [`kingdee-data-exporter`](https://github.com/LittleBeaverStudio/KingdeeDataExporter)
 （金蝶云星空数据导出），本 Skill 会**自动复用它的连接配置**，不需要重复填写。
 
-确认是否已就绪 —— 在导出技能目录执行（五步全绿即可）：
+**只有这几种情况才需要别的配法**：
 
-```bash
-python data_exporter.py --doctor
-```
+| 情况 | 做法 | 边界 |
+|---|---|---|
+| 普通用户（推荐） | `python helpers/setup_credentials.py` | 明文不落盘，绑当前 Windows 用户 |
+| CI / 无人值守 | 环境变量 `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | ⚠️ 环境变量不会被误提交进 git，但**本地并不保密**：同用户其它进程可读、会进日志与崩溃转储 |
+| 旧版明文写法（兼容保留，不推荐） | 写 `~/.workbuddy/kingdee/config.json` | 读到含密码时会提示迁移 |
+| 导出技能的 `config.py` 旧写法 | **无需操作**，同样兼容 | —— |
 
-**只有这几种情况才需要自己配**：
+**读取优先级：环境变量 > 系统加密凭据 > 明文 `config.json` > 导出技能 `config.py`。**
 
-| 情况 | 做法 |
-|---|---|
-| 没装导出技能，想单独用本 Skill | 写 `~/.workbuddy/kingdee/config.json`，只填账套名称即可 |
-| CI / 无人值守 | 用环境变量 `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` |
-| 已经在用导出技能的 `config.py` 旧写法 | **无需操作**，同样兼容 |
+**从旧版明文迁移**（装过旧版的用户请做一次）：本机若存在 `~/.workbuddy/kingdee/config.json`，
+跑一次向导即可 —— 它会读入旧值、加密保存、**默认勾选删除该明文文件**，并提示
+**到金蝶后台修改一次密码**（旧密码曾以明文存在本机，改掉才算真正安全）。
 
-自己配的话写这个（`~/.workbuddy/kingdee/config.json`，在技能目录之外，升级不覆盖）：
+旧版明文写法（仅作参考，`~/.workbuddy/kingdee/config.json`）：
 
 ```json
 {
@@ -68,6 +84,17 @@ python data_exporter.py --doctor
 
 > 🔐 无论哪种方式，都不要把真实账号、密码或账套 ID 提交到公开仓库。
 > 建议给这个 Skill **单独建一个集成用户**，只授予报销相关单据与收票单的权限，不要用管理员账号。
+
+> 📌 **发票云（piazzone）是可选层**：客户只需维护 公司名 / 用户名 / 密码。只有需要
+> 「agent 服务端上传发票」这类功能时才额外配置，且必须用自己企业的发票云授权；
+> 主链路（收票信息写入、明细对齐、附件、提交）**纯金蝶 WebAPI，不需要发票云授权**。
+>
+> 🔑 **多组织注意**：发票云权益**按税号划分**，同一账套下**每家买了收票服务的公司各有一组**
+> `client_id / 购方税号`（官方：「请使用税号对应的企业授权，不要用租户授权！！」）。
+> 向导里**一家一框**、只填 4 项，多家就「＋ 添加一家」——
+> **不用填组织名、也不用填「对应金蝶组织」**：组织名自动取购方企业全称，
+> 上传时按**报销单的组织名称**自动选中对应那家（`--org` 可以留空）。
+> 没对上会**拒绝上传**（`ORGUNMATCHED`），不会拿别家的授权硬跑。
 
 > 为什么本 Skill 自己也要读一次凭据？因为它要做**写操作**（提交单据、下推、挂传附件），
 > 而导出技能是**只读**的、不提供写接口。连接动作必须自己完成，但读的是**同一份配置**，

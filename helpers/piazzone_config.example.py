@@ -6,6 +6,12 @@
 
 用法：复制本文件为 piazzone_config.py 并填写自己的凭证。
 piazzone_config.py 已在 .gitignore 中，不会被提交。
+
+🔑 多家都买了收票服务时：发票云权益**按税号划分**，每家各一组 client_id / 购方税号，
+   且**金蝶侧「金税连接设置」是按业务组织各配一条**（官方原文：「请使用税号对应的
+   企业授权，不要用租户授权！！」）。所以每家在 ENV 里各建一条，并填 `kingdee_orgs`
+   登记它对应的金蝶组织编码 —— 上传时会按单据所属组织自动选对那组授权。
+   推荐改用配置向导（支持多组织、DPAPI 加密不落盘）：python helpers/setup_credentials.py
 """
 
 ACTIVE_ENV = "prod"
@@ -20,6 +26,9 @@ ENV = {
         "client_secret": "请填写你的client_secret",
         "encrypt_key": "请填写你的encrypt_key",
         "enc_type": 0,   # 0=MD5（官方示例统一使用）
+        # 该税号对应的**金蝶组织编码**。⚠️ 本明文写法**只支持单家公司**，
+        # 这个键仅作对照说明；多组织的自动路由请走配置向导。
+        "kingdee_orgs": "101",
     },
     "dev": {
         "base_url": "https://api-dev.piaozone.com/test",
@@ -29,6 +38,7 @@ ENV = {
         "client_secret": "请填写测试环境client_secret",
         "encrypt_key": "",
         "enc_type": 0,
+        "kingdee_orgs": "",
     },
 }
 

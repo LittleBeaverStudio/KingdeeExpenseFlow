@@ -261,11 +261,73 @@ def _read_user_config():
     return data
 
 
+_LEGACY_PLAINTEXT = os.path.join(os.path.expanduser("~"), ".workbuddy", "kingdee", "config.json")
+
+
+def _cfg_from_plaintext(cfg) -> bool:
+    """本次配置是否来自「含密码的旧版明文文件」。"""
+    return bool(cfg.get("_from_plaintext")) and bool(str(cfg.get("password") or "").strip())
+
+
+def _enforce_migration(cfg):
+    """⛔ 强制迁移闸门：仍用「含密码的明文配置」时**拒绝继续**。
+
+    为什么是硬拦而不是提示：只要明文还能用，工具就一直能跑，用户就永远不会去迁移。
+    （实测过：另一个对话里照样取数成功、从不弹窗 —— 就是明文还在。）
+    确有自动化必须临时沿用的，可显式设 `KINGDEE_ALLOW_PLAINTEXT=1` 作为**过渡开关**（会告警）。
+    """
+    if not _cfg_from_plaintext(cfg):
+        return
+    if os.environ.get("KINGDEE_ALLOW_PLAINTEXT") == "1":
+        print("[WARN] KINGDEE_ALLOW_PLAINTEXT=1 —— 正在使用**明文**凭据（过渡开关），请尽快迁移。")
+        return
+    raise SystemExit(
+        "⛔ 已阻断：本机仍用**明文**保存金蝶密码，出于安全考虑不再继续。\n"
+        "   明文文件：%s\n"
+        "\n"
+        "【给智能体的动作指令 —— **不要**叫用户敲命令或打开 .py 文件】\n"
+        "  1. 先把这段念给用户（关键：**删文件和改密码是两件事**，别让用户以为删了就完事）：\n"
+        "     「检测到你本机的金蝶密码是明文存的。建议先到**金蝶后台**把这个账号的密码改掉 ——\n"
+        "       因为文件能删，但『它曾被明文保存』这件事撤不回来（可能已被备份 / 云同步带走）；\n"
+        "       改完回来说一声『需要修改密钥』，我给你弹个窗口录新密码，保存后旧的明文文件会自动删掉。」\n"
+        "  2. 用户说「需要修改密钥」（或「改密码 / 换密码」）时，**由你**在后台运行下面这条\n"
+        "     —— 窗口会弹在用户屏幕上，不要阻塞等待：\n"
+        "         python helpers/setup_credentials.py --change-key\n"
+        "  3. 告诉用户：「窗口已弹出，在里面录入新密码并保存；保存后旧的明文文件会自动删除。」\n"
+        "  4. 用户说填完了，用下面这条确认（只看状态、不开窗）：\n"
+        "         python helpers/setup_credentials.py --check\n"
+        "     看到「就绪状态 : ✅ 已用加密凭据，闸门放行」后，重跑原命令即可。\n"
+        "\n"
+        "   （给用户：全程不用打开任何文件、不用敲命令，窗口由智能体弹出。）\n"
+        "   （过渡期若确有自动化必须沿用明文，可显式设 KINGDEE_ALLOW_PLAINTEXT=1，会打印告警。）\n"
+        % _LEGACY_PLAINTEXT
+    )
+
+
+def _load_encrypted_config():
+    """读取 DPAPI 加密凭据（新方式，明文不落盘）。不可用/不存在返回 None。"""
+    try:
+        import credstore  # 同目录，纯标准库
+    except Exception:
+        return None
+    try:
+        if not credstore.available() or not credstore.exists():
+            return None
+        return credstore.load()
+    except Exception:
+        return None
+
+
 def load_kingdee_config():
     """加载金蝶连接配置。
 
-    优先级：环境变量 > ~/.workbuddy/kingdee/config.json（推荐，技能目录之外）
+    优先级：环境变量 > **DPAPI 加密凭据** > ~/.workbuddy/kingdee/config.json（旧版明文）
             > kingdee-data-exporter 的 config.py（早期写法）
+
+    ⚠️ 关于"环境变量更安全"的边界：环境变量**不会被误提交进 git / 被打包带走**，
+    但它在本地**并不保密**——同一 Windows 用户下的其它进程可读，还会随子进程继承、
+    进崩溃转储与日志。所以本机保密应交由 DPAPI（见 helpers/credstore.py）；
+    环境变量只建议用于 CI / 无人值守。
     """
     cfg = {
         "base_url": os.environ.get("KINGDEE_BASE_URL", ""),
@@ -278,11 +340,26 @@ def load_kingdee_config():
     if cfg["base_url"] and cfg["username"] and cfg["password"]:
         return cfg
 
+    # ① 加密凭据（推荐，明文不落盘）
+    enc = _load_encrypted_config()
+    if enc:
+        merged_enc = {k: v for k, v in enc.items() if not isinstance(v, (dict, list))}
+        if str(merged_enc.get("base_url") or "").strip():
+            cand = {**cfg, **{k: v for k, v in merged_enc.items() if v}}
+            if cand["base_url"] and cand["username"] and cand["password"]:
+                return cand
+            cfg = cand  # 不全则带着已补的字段继续回落
+
+    # ② 旧版明文配置（兼容；含密码时**阻断**，见 _enforce_migration）
     user_cfg = _read_user_config()
     if user_cfg and str(user_cfg.get("base_url") or "").strip():
         merged = {k: v for k, v in user_cfg.items() if not isinstance(v, (dict, list))}
-        return {**cfg, **{k: v for k, v in merged.items() if v}}
+        result = {**cfg, **{k: v for k, v in merged.items() if v}}
+        result["_from_plaintext"] = True
+        _enforce_migration(result)
+        return result
 
+    # ③ 导出技能的 config.py（早期写法）
     for cand in _exporter_candidates():
         if os.path.exists(os.path.join(cand, "config.py")):
             sys.path.insert(0, cand)
@@ -295,16 +372,21 @@ def load_kingdee_config():
     raise SystemExit(
         "未找到金蝶连接配置。任选一种方式配置：\n"
         "\n"
-        "  方式一（推荐，技能升级/重装不会覆盖）：写 ~/.workbuddy/kingdee/config.json\n"
-        '    {"base_url": "https://你的域名/k3cloud/", "acct_name": "账套名称",\n'
-        '     "username": "取数账号", "password": "密码"}\n'
-        "    账套 ID 不用自己找——只填 acct_name 会自动解析，或跑下面第 3 步列出全部账套。\n"
+        "  方式一（**推荐**，明文不落盘）：跑一次配置向导，在弹窗里填 公司名/用户名/密码\n"
+        "    python helpers/setup_credentials.py\n"
+        "    凭据会用 Windows 系统加密保存到 ~/.workbuddy/kingdee/credentials.bin，\n"
+        "    绑当前 Windows 用户；不写明文、不进对话记录。\n"
         "\n"
-        "  方式二（环境变量，不落盘）：\n"
+        "  方式二（环境变量，适合 CI / 无人值守——注意本地并不保密）：\n"
         "    KINGDEE_BASE_URL / KINGDEE_ACCTID（或 KINGDEE_ACCT_NAME）\n"
         "    / KINGDEE_USERNAME / KINGDEE_PASSWORD\n"
         "\n"
-        "  方式三：安装并配置「金蝶云星空数据导出」技能（kingdee-data-exporter），本技能会复用它的 config.py。\n"
+        "  方式三（旧版明文，兼容保留，不推荐）：写 ~/.workbuddy/kingdee/config.json\n"
+        '    {"base_url": "https://你的域名/k3cloud/", "acct_name": "账套名称",\n'
+        '     "username": "取数账号", "password": "密码"}\n'
+        "    账套 ID 不用自己找——只填 acct_name 会自动解析，或跑下面列账套的命令。\n"
+        "\n"
+        "  方式四：安装并配置「金蝶云星空数据导出」技能（kingdee-data-exporter），本技能会复用它的 config.py。\n"
         "\n"
         "配完请自检（会逐步定位是配置、网络、账套、登录还是权限问题）：\n"
         "  cd <kingdee-data-exporter 目录> && python data_exporter.py --doctor\n"
@@ -768,7 +850,8 @@ class Kingdee:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def upload_invoice(self, file_path, bxd_key="", bill_no="", ghf_mc=None, timeout=180):
+    def upload_invoice(self, file_path, bxd_key="", bill_no="", ghf_mc=None,
+                       org_no="", formid=FORM_EXPENSE, timeout=180):
         """把发票文件上传到**发票云**并做真实验票，返回识别结果（含 33 位流水号）。
 
         这是「员工在金蝶里点『选择发票 → 上传 → 发票导入单据』」这一步的**服务端等价物**
@@ -788,10 +871,17 @@ class Kingdee:
         伪造或手工编号会绕开发票云的**防重**（`expenseStatus` 锁票）与**验真**，
         正是 v2.0.11 提交硬闸门要拦的东西。
 
+        🔑 `org_no`（金蝶组织编码，如 "101"/"104"）与 `formid`：**多家都买了收票服务时**
+        用来选对发票云授权。发票云的权益**按税号维度**划分，每个税号各一组
+        client_id / 购方税号。传了 `org_no` 就按编码匹配；**编码对不上会自动读报销单的
+        组织名称、按「购方企业全称」匹配**（所以常规用法下 `--org` 可以留空）。
+        配了多家而两轮都没对上时，直接返回 `errcode="ORGUNMATCHED"` 并**拒绝上传**
+        （不拿别家的授权硬跑）。
+
         返回 dict：{ok, errcode, description, serial_no, invoice_no, amount, tax, total,
-                    seller, seller_tax, buyer_tax, is_repeat, pdf_url, raw}
+                    seller, seller_tax, buyer_tax, is_repeat, pdf_url, piazzone_org, raw}
         """
-        empty = {"ok": False, "serial_no": "", "raw": {}}
+        empty = {"ok": False, "serial_no": "", "raw": {}, "piazzone_org": ""}
         try:
             import piazzone_client as pz      # 延迟导入：未配发票云凭证时不拖累本模块其它命令
         except SystemExit as e:                # piazzone_client 在无凭证时会 SystemExit
@@ -808,6 +898,42 @@ class Kingdee:
                         description="发票云要求 bxd_key（报销单ID）非空 —— 请传 --bill-fid。"
                                     "真实流程里这一步本来就发生在报销单上（界面「选择发票」），"
                                     "所以先有报销单才能上传。")
+
+        # 🔑 多收票组织：按单据所属**金蝶组织**选用对应的发票云企业授权。
+        #    发票云的权益是**按税号维度**划分的（官方原文：「请使用税号对应的企业授权，
+        #    不要用租户授权」）—— 同一账套里 101/104 各有一组，用错会带上错误的购方税号。
+        org_no = str(org_no or "").strip()
+        pz_org_used = ""
+        if hasattr(pz, "select_org"):
+            sel = pz.select_org(kingdee_org=org_no)
+            cands = list(sel.get("candidates") or [])
+            # 配了多家、按编码又对不上 → 自动按**报销单的组织名称**去匹配
+            # （发票云的「组织」就是购方企业本身，名称与购方企业全称一致）。
+            # 这一步让界面不必再维护「组织名」「对应金蝶组织」。
+            if len(cands) > 1 and sel.get("matched") in ("active", "first"):
+                try:
+                    _no, _name, _ = self.bill_org_no(bxd_key, formid)
+                except Exception:               # noqa: BLE001  （读不到就退回原判据）
+                    _name = ""
+                if _name:
+                    sel2 = pz.select_org(org_name=_name)
+                    if sel2.get("matched") == "orgname":
+                        sel = sel2
+                        pz_org_used = str(sel2.get("name") or "")
+            pz_org_used = pz_org_used or str(sel.get("name") or "")
+            cands = list(sel.get("candidates") or [])
+            if len(cands) > 1 and sel.get("matched") in ("active", "first"):
+                return dict(empty, errcode="ORGUNMATCHED", piazzone_org=pz_org_used,
+                            description=(
+                                "发票云里配了 %d 家（%s），单据组织「%s」没对上任何一家。\n"
+                                "      → 请核对：向导「发票云」里各家的**购方企业全称**是否与金蝶"
+                                "组织名称一致（名字一致即可自动匹配，无需填编码）。\n"
+                                "      → 也可用 --org 指定金蝶组织编码来强制命中。\n"
+                                "      → **拒绝**拿别家的授权硬跑（会带上错误的购方税号，"
+                                "流水号也用不了）。"
+                                % (len(cands), "、".join(cands), org_no or "(未指定)")))
+        else:                                   # 老版本 piazzone_client，退回原行为
+            pz_org_used = str(getattr(pz, "PIAZZONE_ORG_USED", "") or "")
 
         uk_res = pz.get_user_key(bxd_key=str(bxd_key or ""),
                                  ghf_mc=ghf_mc or getattr(pz, "GHF_MC", ""),
@@ -848,6 +974,7 @@ class Kingdee:
             "tax_rate": _pct(item.get("taxRate")),
             "item_name": item.get("itemName") or item.get("goodsName") or "",
             "pdf_url": item.get("downloadUrl") or "",
+            "piazzone_org": pz_org_used,
             "raw": resp,
         }
 
@@ -1390,16 +1517,23 @@ def cmd_verify(kd, a):
 
 def cmd_upload(kd, a):
     """把发票文件上传到发票云，拿真流水号（**只读发票云，不写金蝶任何数据**）。"""
+    org = str(getattr(a, "org", "") or "").strip()
     res = kd.upload_invoice(a.file, bxd_key=getattr(a, "bill_fid", "") or "",
-                            bill_no=getattr(a, "bill_no", "") or "")
-    print("上传发票 → 发票云")
+                            bill_no=getattr(a, "bill_no", "") or "", org_no=org,
+                            formid=FORM_TRAVEL if getattr(a, "travel", False) else FORM_EXPENSE)
+    print("上传发票 → 发票云（按金蝶组织自动匹配发票云授权）")
     print("  文件 : %s" % a.file)
+    print("  金蝶组织 : %s" % (org or "(未指定 → 用配置里的 active)"))
+    if res.get("piazzone_org"):
+        print("  发票云授权组织 : %s" % res.get("piazzone_org"))
     print("  结果 : errcode=%s  %s" % (res.get("errcode"), res.get("description")))
     if not res.get("ok"):
         ec = res.get("errcode")
         if ec == "NOCFG":
             print("  ⚠️ 未配置发票云凭证：复制 helpers/piazzone_config.example.py 为 "
                   "piazzone_config.py 填写，或设 PIAZZONE_* 环境变量")
+        elif ec == "ORGUNMATCHED":
+            print("  ⚠️ 组织没对上：给每家补填「对应金蝶组织」，或用 --org 指定")
         elif ec == "1999":
             print("  ⚠️ 识别异常：换更清晰的原件（XML/PDF 优于拍照件）")
         elif ec == "A0706":
@@ -1415,9 +1549,10 @@ def cmd_upload(kd, a):
         print("  %-12s: %s" % (label, res.get(k)))
     print("")
     print("  下一步拿这个流水号建收票单（= 界面的「发票导入单据」）：")
-    print("    python helpers/recvin_link.py create-recvin \"%s\" --org 101 "
+    print("    python helpers/recvin_link.py create-recvin \"%s\" --org %s "
           "--item-name \"<发票项目名>\"%s"
-          % (a.file, (" --link %s" % a.bill_fid) if getattr(a, "bill_fid", "") else ""))
+          % (a.file, org or "101",
+             (" --link %s" % a.bill_fid) if getattr(a, "bill_fid", "") else ""))
     return 0
 
 
@@ -1429,12 +1564,19 @@ def cmd_create_recvin(kd, a):
     """
     print("=" * 68)
     print("① 上传发票到发票云（真实验票）")
+    print("   金蝶组织 : %s（按它匹配发票云企业授权）" % a.org)
     up = kd.upload_invoice(a.file, bxd_key=getattr(a, "bill_fid", "") or "",
-                           bill_no=getattr(a, "bill_no", "") or "")
+                           bill_no=getattr(a, "bill_no", "") or "",
+                           org_no=str(a.org),
+                           formid=FORM_TRAVEL if getattr(a, "travel", False) else FORM_EXPENSE)
+    if up.get("piazzone_org"):
+        print("   发票云授权组织 : %s" % up.get("piazzone_org"))
     print("   errcode=%s  %s" % (up.get("errcode"), up.get("description")))
     if not up.get("ok"):
         if up.get("errcode") == "NOCFG":
             print("   ⚠️ 未配置发票云凭证（helpers/piazzone_config.py 或 PIAZZONE_* 环境变量）")
+        elif up.get("errcode") == "ORGUNMATCHED":
+            print("   ⚠️ 组织没对上：给该组织补填「对应金蝶组织」，或核对 --org")
         print("   ❌ 没拿到真流水号 → **拒绝建票**（凭空手填编号正是硬闸门要拦的票）")
         return 2
     serial = up["serial_no"]
@@ -1566,6 +1708,10 @@ def main():
     s.add_argument("--bill-fid", required=True,
                    help="报销单 FID（**必填**：发票云要求报销单ID非空）")
     s.add_argument("--bill-no", help="报销单编号（可选）")
+    s.add_argument("--org", default="",
+                   help="金蝶组织编码（如 101 / 104），**可留空**。留空时会按报销单的"
+                        "组织名称自动匹配发票云里对应的那家公司（推荐）；"
+                        "只有自动匹配失败时才需要显式指定")
     s.set_defaults(fn=cmd_upload)
 
     s = sub.add_parser("create-recvin",
@@ -1574,7 +1720,9 @@ def main():
     s.add_argument("file", help="发票文件路径")
     s.add_argument("--bill-fid", required=True,
                    help="报销单 FID（**必填**：发票云要求报销单ID非空）")
-    s.add_argument("--org", default="101", help="来源/结算组织编号（默认 101）")
+    s.add_argument("--org", default="101",
+                   help="来源/结算组织编号（默认 101）。**同时用于匹配发票云企业授权** —— "
+                        "多家都买了收票服务时填错组织会带上错误的购方税号")
     s.add_argument("--item-name", default="",
                    help="发票明细项目名称（发票云不返回，必填；如 '*交通运输服务*客运服务费'）")
     s.add_argument("--open-date", default="", help="开票日期 YYYY-MM-DD（留空=今天）")
