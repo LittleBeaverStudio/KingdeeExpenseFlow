@@ -254,7 +254,7 @@ KingdeeExpenseFlow/
 ├── references/
 │   ├── field_cookbook.md        字段级接口配方（实测）
 │   └── policy_rules.md          报销制度**模板**（全是【待填】空位；本公司规则请放 `references/policy_rules.local.md`，该文件不进仓库）
-└── 官方接口说明/                金蝶 WebAPI 原始文档
+└── official-api/                金蝶 WebAPI 原始文档（ASCII 命名，防解压乱码）
 ```
 
 支持从 GitHub 扫描 Skill 的工具，可以直接使用仓库地址：
@@ -329,7 +329,7 @@ helpers/expense_edit.py      明细金额对齐 / 明细↔发票联动 / 附件
 helpers/invoice_classifier.py 发票与行程单分类、字段提取、双算预警
 references/field_cookbook.md  字段与接口配方手册（全部为实测结论）
 references/policy_rules.md    差旅住宿/招待费等报销制度**模板**（全是【待填】空位；本公司规则请放 `references/policy_rules.local.md`，该文件不进仓库）
-官方接口说明/                 金蝶 WebAPI 官方文档（Save / Submit / 收票单）
+official-api/                  金蝶 WebAPI 官方文档（Save / Submit / 收票单）
 ```
 
 > 本工具仅用于你有权访问的金蝶环境。使用者需要自行负责凭据保管、权限控制和数据合规。

@@ -449,7 +449,7 @@ org 105 这类**只用附件**的组织，跟随其既有做法走附件即可 �
 | `references/field_cookbook.md` | 费用申请单 / 出差申请单的 Save 模板与全部必填字段；查询与载荷写法 |
 | `references/policy_rules.md` | 报销制度**模板**（全是【待填】空位） |
 | `references/implementation-notes.md` | **实测记录与版本沿革**：版本变更、`ValidateFlag` 越狱机制、闸门验证记录、金额勾稽原始数据、发票云与手工建票对比、跨组织三轮修正、收票池可见性三组对照、权限三层次、编辑锁与网络抖动 |
-| `官方接口说明/` | 金蝶 WebAPI 官方原始文档（Save / Submit / 收票单） |
+| `official-api/` | 金蝶 WebAPI 官方原始文档（`WebAPI-Save.txt` / `WebAPI-Submit.txt` / `IV_ReceivedInvoice.txt`）；目录与文件名用 ASCII，避免压缩包跨系统解压乱码 |
 
 ## 报销制度提醒（制度不内置）
 
