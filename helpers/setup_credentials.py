@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""金蝶凭据配置向导（弹窗）—— **明文不落盘**。
+"""金蝶凭据配置向导（弹窗 / 文字向导）—— **明文不落盘**。
 
 > 本文件是 **kingdee-expense-flow（报销助手）专版**，比导出/分析技能的版本多
 > 「发票云」一组（且支持**多组织**）。导出 / 分析技能不需要发票云，它们的同名脚本不含该组。
 
 三条硬规矩
 ──────────
-1. **不经过对话**：凭据只在本地弹窗里输入，不进任何聊天记录。
+1. **不经过对话**：凭据只在本地窗口里输入，不进任何聊天记录。
 2. **不落明文**：敏感字段经 DPAPI 加密写入 `~/.workbuddy/kingdee/credentials.bin`。
 3. **不回显、不写日志**：输入框掩码；只打印字段名是否存在，永不打印值。
 
@@ -16,8 +16,28 @@
   python helpers/setup_credentials.py --change-key # 「修改密钥」模式
   python helpers/setup_credentials.py --check      # 只看状态，不开窗
   python helpers/setup_credentials.py --delete     # 清除已保存凭据
+  python helpers/setup_credentials.py --console    # 强制文字向导（排障用）
 
 > **用户不需要打开这个 .py，也不需要敲命令** —— 由智能体代为调用，窗口弹在用户屏幕上。
+
+退出码（**agent 必须按码判断结果，不要看有没有报错**）
+──────────────────────────────────────────────────
+  0   已加密保存，可以继续跑业务命令
+  10  用户取消 / 关窗 / 超时（**没改成**，不要盲目重跑）
+  12  已经有一个配置窗口开着（等那个窗填完，别开第二个）
+  2   本机环境不支持（非 Windows / 无 DPAPI / 图形与文字界面都不可用）
+  3   保存失败（窗口里已提示原因）
+  4   图形界面不可用，需要降级（内部用，正常不会作为最终结果返回）
+
+界面降级顺序（**零安装**，绝不静默装任何东西）
+──────────────────────────────────────────
+  L0 本进程有 tkinter → 直接弹窗
+  L1 本进程没有 → 到本机找**带 tkinter 的其它 Python**（py 启动器 / 注册表 / 安装目录），
+     由它以 `--ui-child` 子进程弹窗。用户无感，也不改系统 PATH。
+  L2 一个都没有 → `--console-child` 在**新控制台窗口**里跑文字向导。
+     ⚠️ 新控制台是关键：密码输在那个窗口自己的 stdin，**不进 agent 的管道**，
+     所以不会出现在对话记录里。绝不能在原进程里 input()。
+  L3 都不行 → 如实回报，给「用户点确认后才协助安装」的可选动作；**不做静默安装**。
 
 ⚠️ 实现注意（踩过的坑）
 ──────────────────────
@@ -30,9 +50,15 @@ Tcl 变量 → **输入框被清空、预填全部丢失**（实测四个框全�
 from __future__ import annotations
 
 import argparse
+import getpass
+import glob
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,12 +68,29 @@ import credstore  # noqa: E402
 LEGACY_CONFIG = Path.home() / ".workbuddy" / "kingdee" / "config.json"
 PIAZZONE_DEFAULT_BASE = "https://api.piaozone.com"
 
+# ── 退出码（agent 按码判断，别按输出文字猜）──
+EXIT_OK = 0
+EXIT_CANCELLED = 10
+EXIT_BUSY = 12
+EXIT_UNSUPPORTED = 2
+EXIT_SAVE_FAILED = 3
+EXIT_NEED_FALLBACK = 4          # 内部信号：图形界面不可用
+
+# 窗口无操作自动关闭（毫秒）——用户走开后后台进程不会一直挂着
+IDLE_TIMEOUT_MS = 20 * 60 * 1000
+
+LOCK_PATH = credstore.STORE_DIR / ".setup.lock"
+
 _EXPORTER_CANDIDATES = (
     Path(__file__).resolve().parent,
     Path(__file__).resolve().parent.parent,
     Path.home() / ".workbuddy" / "skills" / "kingdee-data-exporter",
     Path.home() / ".workbuddy" / "skills" / "KingdeeDataExporter",
 )
+
+
+class _NoUI(Exception):
+    """图形界面建不起来（没有 tkinter、TclError、无桌面会话）。"""
 
 
 # ─────────────────────────── 预填来源 ───────────────────────────
@@ -150,6 +193,185 @@ def _lookup_acct_name(base_url: str, acctid: str, timeout: int = 8) -> str:
     return ""
 
 
+# ─────────────── 单实例锁：别让用户看到两个配置窗 ───────────────
+
+# 用**操作系统级文件锁**（Windows `msvcrt.locking` / POSIX `flock`），不用 PID 探测：
+# 进程一退出内核自动释放，**不存在"陈旧锁把用户挡在门外"**。锁文件本身留作长期令牌，不删。
+_LOCK_FH = None
+
+
+def _acquire_lock() -> bool:
+    """拿单实例锁；拿不到说明已经有一个配置窗口开着。锁不住文件时不拦用户。"""
+    global _LOCK_FH
+    try:
+        credstore.STORE_DIR.mkdir(parents=True, exist_ok=True)
+        fh = open(LOCK_PATH, "a+")
+    except OSError:
+        return True
+    try:
+        try:
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except ImportError:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    try:                        # 只作排查线索，读不到也无所谓
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except OSError:
+        pass
+    _LOCK_FH = fh
+    return True
+
+
+def _release_lock() -> None:
+    global _LOCK_FH
+    if _LOCK_FH is None:
+        return
+    try:
+        _LOCK_FH.seek(0)
+        try:
+            import msvcrt
+            msvcrt.locking(_LOCK_FH.fileno(), msvcrt.LK_UNLCK, 1)
+        except ImportError:
+            import fcntl
+            fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        _LOCK_FH.close()
+    except OSError:
+        pass
+    _LOCK_FH = None
+
+
+# ─────────────── 找一台机器上「带 tkinter 的 Python」（零安装） ───────────────
+
+_PROBE_CODE = ("import sys, tkinter; "
+               "sys.exit(0 if sys.version_info >= (3, 8) and tkinter.TkVersion else 1)")
+
+
+def _has_tkinter() -> bool:
+    try:
+        import tkinter  # noqa: F401
+        return bool(tkinter.TkVersion)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _probe(prefix: list[str]) -> bool:
+    try:
+        res = subprocess.run(prefix + ["-c", _PROBE_CODE],
+                             capture_output=True, timeout=10)
+        return res.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _registry_pythons() -> list[str]:
+    if os.name != "nt":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    out: list[str] = []
+    roots = [(winreg.HKEY_CURRENT_USER, r"Software\Python\PythonCore"),
+             (winreg.HKEY_LOCAL_MACHINE, r"Software\Python\PythonCore"),
+             (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Python\PythonCore")]
+    for hive, base in roots:
+        try:
+            with winreg.OpenKey(hive, base) as key:
+                count = winreg.QueryInfoKey(key)[0]
+                tags = [winreg.EnumKey(key, i) for i in range(count)]
+        except OSError:
+            continue
+        for tag in tags:
+            try:
+                with winreg.OpenKey(hive, base + "\\" + tag + "\\InstallPath") as ik:
+                    val, _ = winreg.QueryValueEx(ik, "")
+            except OSError:
+                continue
+            path = str(val or "").strip()
+            if not path:
+                continue
+            exe = path if path.lower().endswith(".exe") else os.path.join(path, "python.exe")
+            out.append(exe)
+    return out
+
+
+def _iter_python_candidates():
+    """产出「命令前缀列表」：普通解释器是 [exe]，py 启动器是 [py, -3.11]。"""
+    seen: set[str] = set()
+    me = os.path.normcase(os.path.abspath(sys.executable))
+
+    def fresh(path: str) -> bool:
+        if not path or not os.path.isfile(path):
+            return False
+        key = os.path.normcase(os.path.abspath(path))
+        if key == me or key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    # ① py 启动器：-0p 列出已注册版本；路径解析不出来就退化成 `py -X.Y`
+    launcher = shutil.which("py")
+    if launcher:
+        try:
+            listed = subprocess.run([launcher, "-0p"], capture_output=True,
+                                    text=True, timeout=10).stdout or ""
+        except Exception:  # noqa: BLE001
+            listed = ""
+        for line in listed.splitlines():
+            m = re.search(r"([A-Za-z]:\\[^\r\n]*?pythonw?\.exe)\s*$", line.strip())
+            if m and fresh(m.group(1)):
+                yield [m.group(1)]
+        for tag in re.findall(r"-V:(\d+\.\d+)", listed):
+            yield [launcher, "-" + tag]
+
+    # ② 注册表登记的安装位置（官方安装包一定写这里）
+    for path in _registry_pythons():
+        if fresh(path):
+            yield [path]
+
+    # ③ 常见安装目录
+    patterns = [r"%LOCALAPPDATA%\Programs\Python\Python3*\python.exe",
+                r"%PROGRAMFILES%\Python3*\python.exe",
+                r"%PROGRAMFILES(X86)%\Python3*\python.exe",
+                r"C:\Python3*\python.exe"]
+    for pat in patterns:
+        expanded = os.path.expandvars(pat)
+        if "%" in expanded:                     # 变量不存在就跳过，别去 glob 字面量
+            continue
+        for path in sorted(glob.glob(expanded), reverse=True):
+            if fresh(path):
+                yield [path]
+
+    # ④ PATH 上的 python3 / python（当前那个没 tkinter，会被去重挡掉）
+    for name in ("python3", "python"):
+        path = shutil.which(name)
+        if path and fresh(path):
+            yield [path]
+
+
+def _find_tkinter_python(limit: int = 6) -> list[str] | None:
+    """返回能弹窗的解释器命令前缀；找不到返回 None。最多探 limit 个，避免拖慢。"""
+    tried = 0
+    for prefix in _iter_python_candidates():
+        tried += 1
+        if tried > limit:
+            break
+        if _probe(prefix):
+            return prefix
+    return None
+
+
 # ─────────────────── 发票云：多组织数据模型（兼容旧扁平结构） ───────────────────
 
 _PZ_FIELDS = ("ghf_mc", "tax_no", "client_id", "client_secret", "kingdee_orgs")
@@ -207,12 +429,44 @@ def _orgs_from_rows(rows: list) -> tuple:
     return out, next(iter(out), "")
 
 
+def _save_payload(payload: dict) -> tuple[bool, str, list[str]]:
+    """统一落盘：加密保存 → 删旧明文 → 给用户看的提示行。"""
+    try:
+        credstore.save(payload)
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc), []
+    notes = ["凭据已加密保存。"]
+    if payload.get("piazzone"):
+        notes.append("发票云：已保存 %d 家。" % len(payload["piazzone"]["orgs"]))
+    if LEGACY_CONFIG.is_file():
+        try:
+            LEGACY_CONFIG.unlink()
+            notes.append("旧明文文件已删除。")
+        except OSError as exc:
+            notes.append("⚠️ 明文文件删除失败，请手动删除：\n%s\n（%s）" % (LEGACY_CONFIG, exc))
+    return True, "", notes
+
+
 # ─────────────────────────────── 界面 ───────────────────────────────
 
 def run_gui(change_key: bool = False) -> int:
-    import tkinter as tk
-    from tkinter import messagebox, ttk
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:  # noqa: BLE001
+        raise _NoUI("没有 tkinter（%s）" % exc) from exc
 
+    if not _acquire_lock():
+        print("已经有一个凭据配置窗口开着。请在那个窗口里填完，不要再开第二个。")
+        return EXIT_BUSY
+
+    try:
+        return _run_gui_inner(change_key, tk, messagebox, ttk)
+    finally:
+        _release_lock()
+
+
+def _run_gui_inner(change_key: bool, tk, messagebox, ttk) -> int:
     pre = collect_prefill()
     legacy_has_secret = bool(str(_read_legacy_config().get("password") or "").strip())
     pz_orgs, _pz_active = _piazzone_state(pre.get("piazzone"))
@@ -222,7 +476,11 @@ def run_gui(change_key: bool = False) -> int:
     if not acct_name and pre.get("acctid"):
         acct_name = _lookup_acct_name(pre.get("base_url"), pre.get("acctid"))
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as exc:  # noqa: BLE001  TclError / 无桌面会话
+        raise _NoUI("窗口创建失败（%s）" % exc) from exc
+
     root.title("金蝶云星空 · 修改密钥" if change_key else "金蝶云星空 · 凭据配置")
     root.resizable(False, True)
     root.attributes("-topmost", True)     # 配置窗不被微信之类压住（配置完即关，不碍事）
@@ -278,6 +536,9 @@ def run_gui(change_key: bool = False) -> int:
     def sv(key: str, value: str = "") -> tk.StringVar:
         VAR[key] = tk.StringVar(value=value)
         return VAR[key]
+
+    # 结果：0=已保存；10=取消/关窗/超时。mainloop 结束后按它返回。
+    RESULT = {"code": None}
 
     # 结构：上面是**可滚动**的内容区，下面是**固定**的页脚（保存/取消永远看得见）。
     # 之前是把所有东西都塞进一个 Frame，公司加多了窗口就顶出屏幕，「保存」直接看不见 —— 现在不会。
@@ -335,21 +596,42 @@ def run_gui(change_key: bool = False) -> int:
         ("base_url", "服务器地址", pre.get("base_url", "")),
         ("acct_name", "公司名 / 账套", acct_name),
         ("username", "用户名", pre.get("username", "")),
-        ("password", "新密码" if change_key else "密码", ""),
     ]
     for i, (key, label, val) in enumerate(kd_rows, start=2):
         ttk.Label(frm, text=label).grid(row=i, column=0, sticky="e", **PAD)
-        ttk.Entry(frm, textvariable=sv(key, str(val or "")), width=40,
-                  show="*" if key == "password" else ""
+        ttk.Entry(frm, textvariable=sv(key, str(val or "")), width=40
                   ).grid(row=i, column=1, columnspan=2, sticky="we", **PAD)
 
+    # ── 密码行：带「显示」勾选（打错的代价是撞锁号计数，必须让人能核对） ──
+    pwd_row = 2 + len(kd_rows)
+    ttk.Label(frm, text="新密码" if change_key else "密码"
+              ).grid(row=pwd_row, column=0, sticky="e", **PAD)
+    pwd_entry = ttk.Entry(frm, textvariable=sv("password", ""), width=40, show="*")
+    pwd_entry.grid(row=pwd_row, column=1, sticky="we", **PAD)
+    show_pwd = tk.BooleanVar(value=False)
+
+    def _toggle_pwd() -> None:
+        pwd_entry.configure(show="" if show_pwd.get() else "*")
+        if change_key and pwd2_entry is not None:
+            pwd2_entry.configure(show="" if show_pwd.get() else "*")
+
+    ttk.Checkbutton(frm, text="显示", variable=show_pwd, command=_toggle_pwd
+                    ).grid(row=pwd_row, column=2, sticky="w", padx=(0, 4))
+
+    # ── 改密钥时要二次确认：后台密码已改、本地打错的后果是必然登录失败 ──
+    pwd2_entry = None
+    if change_key:
+        ttk.Label(frm, text="再输一次").grid(row=pwd_row + 1, column=0, sticky="e", **PAD)
+        pwd2_entry = ttk.Entry(frm, textvariable=sv("password2", ""), width=40, show="*")
+        pwd2_entry.grid(row=pwd_row + 1, column=1, columnspan=2, sticky="we", **PAD)
 
     # ── 发票云 ──
     # 发票云的「组织」就是购方企业本身 —— 组织名自动取「购方企业全称」，界面不再问；
     # 也不维护「对应金蝶组织」：上传/建票时按**单据的组织名称**自动匹配
     # （见 piazzone_client.select_org(org_name=…)）。所以界面只留「一家一框」、无标题。
+    pz_head_row = pwd_row + (2 if change_key else 1) + 1
     pz_head = ttk.Frame(frm, style="Card.TFrame")
-    pz_head.grid(row=7, column=0, columnspan=3, sticky="we", pady=(26, 4))
+    pz_head.grid(row=pz_head_row, column=0, columnspan=3, sticky="we", pady=(26, 4))
     pz_head.columnconfigure(0, weight=1)
     ttk.Label(pz_head, text="发票云（人人报销模块发票智慧管家收票、验票）", style="H.TLabel"
               ).grid(row=0, column=0, sticky="w")
@@ -358,7 +640,7 @@ def run_gui(change_key: bool = False) -> int:
                     ("client_id", "client_id"), ("client_secret", "client_secret")]
 
     pz_host = ttk.Frame(frm)
-    pz_host.grid(row=8, column=0, columnspan=3, sticky="we", pady=(6, 0))
+    pz_host.grid(row=pz_head_row + 1, column=0, columnspan=3, sticky="we", pady=(6, 0))
     pz_host.columnconfigure(0, weight=1)
     blocks: list = []   # 每个元素 {frame: 卡片外框, vars: 字段, btn: 这张卡片自己的删除按钮}
 
@@ -420,6 +702,15 @@ def run_gui(change_key: bool = False) -> int:
     if not blocks:
         add_block()
 
+    # ── 脏检查用的快照（关窗前判断「有没有填过东西」）──
+    def _snapshot() -> tuple:
+        parts = [v.get() for v in VAR.values()]
+        for b in blocks:
+            parts.extend(v.get() for v in b["vars"].values())
+        return tuple(parts)
+
+    initial = _snapshot()
+
     # ── 页脚（固定在 root 上，不随内容滚动）──
     def do_save() -> None:
         base_url = VAR["base_url"].get().strip()
@@ -428,6 +719,10 @@ def run_gui(change_key: bool = False) -> int:
         password = VAR["password"].get()
         if not (username and password):
             messagebox.showwarning("还差一点", "用户名和密码是必填项。", parent=root)
+            return
+        if change_key and password != VAR["password2"].get():
+            messagebox.showwarning("两次不一致", "两次输入的密码不一样，请核对后再保存。",
+                                   parent=root)
             return
         if not (base_url or acct_name_v):
             messagebox.showwarning("还差一点", "请填服务器地址或公司名。", parent=root)
@@ -442,25 +737,68 @@ def run_gui(change_key: bool = False) -> int:
         if pz:
             payload["piazzone"] = pz
 
-        try:
-            credstore.save(payload)
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("保存失败", str(exc), parent=root)
+        ok, err, notes = _save_payload(payload)
+        if not ok:
+            messagebox.showerror("保存失败", err, parent=root)
             return
-
-        notes = ["凭据已加密保存。"]
-        if pz:
-            notes.append("发票云：已保存 %d 家。" % len(pz["orgs"]))
-        if LEGACY_CONFIG.is_file():
-            try:
-                LEGACY_CONFIG.unlink()
-                notes.append("旧明文文件已删除。")
-            except OSError as exc:
-                notes.append("⚠️ 明文文件删除失败，请手动删除：\n%s\n（%s）" % (LEGACY_CONFIG, exc))
         if legacy_has_secret:
             notes.append("提醒：请确认已在金蝶后台改掉旧密码。")
         messagebox.showinfo("完成", "\n".join(notes), parent=root)
-        root.destroy()                      # 保存成功 → 自动关闭配置窗口
+        RESULT["code"] = EXIT_OK
+        root.destroy()
+
+    def on_close() -> None:
+        """关窗 / 取消 / 超时统一出口：有改动才问一句，然后返回 10（= 没改成）。"""
+        if RESULT["code"] == EXIT_OK:
+            try:
+                root.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            if _snapshot() != initial:
+                if not messagebox.askyesno("还没保存",
+                                           "填写的内容还没保存，确定关闭吗？",
+                                           default="no", parent=root):
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+        RESULT["code"] = EXIT_CANCELLED
+        try:
+            root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    # ── 空闲看门狗：用户走开后不会一直挂着一个后台进程 ──
+    watchdog = {"id": None}
+
+    def _arm() -> None:
+        if watchdog["id"] is not None:
+            try:
+                root.after_cancel(watchdog["id"])
+            except Exception:  # noqa: BLE001
+                pass
+        watchdog["id"] = root.after(IDLE_TIMEOUT_MS, _expire)
+
+    def _expire() -> None:
+        watchdog["id"] = None
+        try:
+            messagebox.showinfo("已自动关闭",
+                                "窗口 20 分钟没有操作，已自动关闭（没有保存任何内容）。\n"
+                                "需要时跟我说一声，我再帮你打开。", parent=root)
+        except Exception:  # noqa: BLE001
+            pass
+        RESULT["code"] = EXIT_CANCELLED
+        try:
+            root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+    root.bind_all("<Key>", lambda _e: _arm(), add="+")
+    root.bind_all("<Button-1>", lambda _e: _arm(), add="+")
+    _arm()
 
     # ── 固定页脚：只放「保存 / 取消」（右对齐；「删除 / 添加」在「发票云」那行）──
     # 页脚用**窗体底色**（灰），与白色内容区自然断开 —— 不再画线
@@ -471,11 +809,16 @@ def run_gui(change_key: bool = False) -> int:
     foot.grid(row=0, column=0, sticky="we")
     foot.columnconfigure(0, weight=1)
 
+    # 左：一句"为什么是弹窗"，让用户明白不是网站在要密码
+    ttk.Label(foot, text="凭据在本机加密保存，不经对话框、不进日志",
+              style="Page.TLabel", font=(FS, 9)
+              ).grid(row=0, column=0, sticky="w")
+
     right = ttk.Frame(foot, style="Page.TFrame")
-    right.grid(row=0, column=0, sticky="e")
+    right.grid(row=0, column=1, sticky="e")
     ttk.Button(right, text="保存", width=9, style="Primary.TButton",
                command=do_save).grid(row=0, column=0, padx=(0, 8))
-    ttk.Button(right, text="取消", width=9, command=root.destroy).grid(row=0, column=1)
+    ttk.Button(right, text="取消", width=9, command=on_close).grid(row=0, column=1)
 
     # 定尺寸：内容超高就给滚动条，页脚始终贴着底部、永远看得见
     try:
@@ -497,11 +840,162 @@ def run_gui(change_key: bool = False) -> int:
     except Exception:  # noqa: BLE001
         pass
 
+    try:
+        root.lift()
+        root.focus_force()
+    except Exception:  # noqa: BLE001
+        pass
+
     root.mainloop()
-    return 0
+    return RESULT["code"] if RESULT["code"] is not None else EXIT_CANCELLED
 
 
-# ─────────────────────────────── CLI ───────────────────────────────
+# ────────────────────────── 文字向导（无 tkinter 时的降级） ──────────────────────────
+
+def _console_wizard(change_key: bool = False) -> int:
+    """在新控制台窗口里跑的文字向导。
+
+    ⚠️ 必须由 `--console-child` 在**独立控制台**里启动：密码走那个窗口自己的 stdin，
+    不会经过 agent 的管道，所以不会出现在对话记录里。
+    """
+    pre = collect_prefill()
+    legacy_has_secret = bool(str(_read_legacy_config().get("password") or "").strip())
+    pz_orgs, _active = _piazzone_state(pre.get("piazzone"))
+
+    print("=" * 64)
+    print("金蝶云星空 · 凭据录入（文字向导）")
+    print("在这里输入的密码不会出现在对话里，也不会以明文存到磁盘。")
+    print("直接关掉这个窗口 = 放弃，不会保存任何内容。")
+    print("=" * 64)
+
+    def ask(label: str, default: str = "", secret: bool = False) -> str | None:
+        while True:
+            hint = "" if (secret or not default) else " [回车沿用 %s]" % default
+            try:
+                if secret:
+                    val = getpass.getpass("  %s: " % label)
+                else:
+                    val = input("  %s%s: " % (label, hint))
+            except (EOFError, KeyboardInterrupt):
+                return None
+            val = val if secret else val.strip()
+            if secret:
+                if val:
+                    return val
+            else:
+                if val:
+                    return val
+                if default:
+                    return default
+            print("    ↑ 这一项必填。")
+
+    base_url = ask("服务器地址", str(pre.get("base_url") or ""))
+    if base_url is None:
+        print("\n已取消，未保存。")
+        return EXIT_CANCELLED
+    acct_name = ask("公司名 / 账套", str(pre.get("acct_name") or ""))
+    if acct_name is None:
+        print("\n已取消，未保存。")
+        return EXIT_CANCELLED
+    username = ask("用户名", str(pre.get("username") or ""))
+    if username is None:
+        print("\n已取消，未保存。")
+        return EXIT_CANCELLED
+    password = ask("新密码" if change_key else "密码", secret=True)
+    if password is None:
+        print("\n已取消，未保存。")
+        return EXIT_CANCELLED
+    again = ask("再输一次（防打错）", secret=True)
+    if again is None:
+        print("\n已取消，未保存。")
+        return EXIT_CANCELLED
+    if password != again:
+        print("\n两次输入不一致，未保存。请重新运行再填一次。")
+        return EXIT_CANCELLED
+
+    payload = {"base_url": base_url, "acct_name": acct_name,
+               "username": username, "password": password}
+    if str(pre.get("acctid") or "").strip():
+        payload["acctid"] = str(pre["acctid"]).strip()
+
+    # 发票云（可选）
+    saved_orgs = dict(pz_orgs or {})
+    if saved_orgs:
+        print("\n发票云：当前已保存 %d 家。" % len(saved_orgs))
+        ans = input("  要重新维护这一组吗？(y/N): ").strip().lower()
+    else:
+        ans = input("\n发票云（可选，仅验票/服务端上传才需要）现在配置吗？(y/N): ").strip().lower()
+
+    rows: list = []
+    if ans == "y":
+        print("  一家一家填，购方企业全称留空表示结束。")
+        while True:
+            name = input("    购方企业全称（留空结束）: ").strip()
+            if not name:
+                break
+            tax_no = input("    购方税号: ").strip()
+            cid = input("    client_id: ").strip()
+            csec = getpass.getpass("    client_secret: ")
+            rows.append({"ghf_mc": name, "tax_no": tax_no,
+                         "client_id": cid, "client_secret": csec})
+        orgs, active = _orgs_from_rows(rows)
+        pz = _piazzone_payload(orgs, active)
+        if pz:
+            payload["piazzone"] = pz
+    elif saved_orgs:
+        pz = _piazzone_payload(saved_orgs, _active)
+        if pz:
+            payload["piazzone"] = pz
+
+    ok, err, notes = _save_payload(payload)
+    if not ok:
+        print("\n❌ 保存失败：%s" % err)
+        return EXIT_SAVE_FAILED
+    if legacy_has_secret:
+        notes.append("提醒：请确认已在金蝶后台改掉旧密码。")
+    print("")
+    for line in notes:
+        print("✓ " + line)
+    print("✓ 就绪状态：已用加密凭据，闸门放行")
+    try:      # 独立控制台会随进程退出而关闭，停一下让用户看清结果
+        input("\n按回车关闭这个窗口…")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return EXIT_OK
+
+
+# ─────────────────────────────── 启动器 ───────────────────────────────
+
+def _try_ui(change_key: bool) -> int | None:
+    """弹窗；建不起来（或中途异常）返回 None，交给上层降级 —— 绝不把 traceback 喷给用户。"""
+    try:
+        return run_gui(change_key=change_key)
+    except _NoUI as exc:
+        print("图形界面打不开：%s" % exc)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print("图形界面异常（%s: %s），改用其它方式。" % (type(exc).__name__, exc))
+        return None
+
+
+def _relaunch(prefix: list[str], flag: str, change_key: bool) -> int:
+    """用另一个解释器/模式重启自己，并把退出码原样带回。"""
+    script = str(Path(__file__).resolve())
+    cmd = list(prefix) + [script, flag] + (["--change-key"] if change_key else [])
+    flags = 0
+    if flag == "--console-child":
+        # 关键：独立控制台 → 子进程的 stdin/stdout 都不接 agent 的管道
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.run(cmd, creationflags=flags, timeout=40 * 60)
+    except subprocess.TimeoutExpired:
+        print("录入窗口超过 40 分钟未完成，已放弃（没有保存任何内容）。")
+        return EXIT_CANCELLED
+    except OSError as exc:
+        print("启动 %s 失败：%s" % (" ".join(cmd), exc))
+        return EXIT_NEED_FALLBACK
+    return proc.returncode
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="金蝶凭据配置向导（弹窗、加密保存、不落明文）")
@@ -509,16 +1003,22 @@ def main() -> int:
     ap.add_argument("--delete", action="store_true", help="删除已保存的加密凭据")
     ap.add_argument("--change-key", dest="change_key", action="store_true",
                     help="「修改密钥」模式开窗")
+    ap.add_argument("--console", action="store_true", help="强制文字向导（排障用）")
+    ap.add_argument("--ui-child", dest="ui_child", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--console-child", dest="console_child", action="store_true",
+                    help=argparse.SUPPRESS)
     a = ap.parse_args()
 
     if a.delete:
         print("已删除" if credstore.delete() else "（没有已保存的加密凭据）")
-        return 0
+        return EXIT_OK
+
     if a.check:
         data = credstore.load() or {}
         orgs, active = _piazzone_state(data.get("piazzone"))
         print("加密凭据文件 :", credstore.STORE_PATH, "存在" if credstore.exists() else "不存在")
         print("加密凭据内容 :", credstore.describe())
+        print("图形界面     :", "可用" if _has_tkinter() else "当前解释器没有 tkinter（会自动另找）")
         if orgs:
             print("发票云组织   : %d 家（active=%s）" % (len(orgs), active or "-"))
             for _n, _v in orgs.items():
@@ -536,16 +1036,40 @@ def main() -> int:
             print("就绪状态     : ✅ 已用加密凭据，闸门放行")
         else:
             print("就绪状态     : ⚠️ 尚无任何凭据，需先配置")
-        return 0
+        return EXIT_OK
 
     if not credstore.available():
-        print("当前系统不支持 DPAPI（非 Windows）。请改用环境变量 KINGDEE_* / PIAZZONE_*。")
-        return 2
-    try:
-        return run_gui(change_key=a.change_key)
-    except ImportError:
-        print("未找到 tkinter，无法弹窗。请改用环境变量方式注入凭据。")
-        return 2
+        print("本机不是 Windows（或缺少 DPAPI），无法加密保存凭据，因此不提供录入窗口。")
+        print("可选：① 在 Windows 电脑上使用本技能（推荐）；")
+        print("      ② 临时用环境变量 KINGDEE_* —— 注意环境变量在本机并不保密。")
+        return EXIT_UNSUPPORTED
+
+    # 子进程入口：只跑指定界面，不再探测，避免无限递归
+    if a.ui_child:
+        code = _try_ui(a.change_key)
+        return EXIT_NEED_FALLBACK if code is None else code
+    if a.console_child or a.console:
+        return _console_wizard(change_key=a.change_key)
+
+    # L0：当前解释器就能弹窗
+    if _has_tkinter():
+        code = _try_ui(a.change_key)
+        if code is not None:
+            return code
+
+    # L1：找本机带 tkinter 的 Python（零安装，不改系统环境）
+    prefix = _find_tkinter_python()
+    if prefix:
+        print("当前解释器没有 tkinter，改用本机已装的 Python 打开录入窗口：%s"
+              % " ".join(prefix))
+        code = _relaunch(prefix, "--ui-child", a.change_key)
+        if code != EXIT_NEED_FALLBACK:
+            return code
+
+    # L2：文字向导（独立控制台，密码不进对话）
+    print("本机没有可用的图形界面，改用文字向导：马上会弹出一个黑色的录入窗口，")
+    print("请在**那个窗口**里按提示填写（密码不会出现在这里）。")
+    return _relaunch([sys.executable], "--console-child", a.change_key)
 
 
 if __name__ == "__main__":

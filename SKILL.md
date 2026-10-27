@@ -2,13 +2,13 @@
 name: kingdee-expense-flow
 slug: kingdee-expense-flow
 displayName: 金蝶云星空报销助手
-version: 2.3.1
+version: 2.3.2
 summary: 小河狸工作室出品：金蝶云星空费用/差旅报销全流程提交，员工不登录金蝶也能报销。
 description: 小河狸工作室出品。金蝶云星空「费用/差旅报销全流程」提交 Skill：员工无需登录金蝶，在对话里把发票交上来，agent 用纯 WebAPI 完成「费用申请单 → 下推报销单 → 挂收票信息／传附件 → 提交审批」，差旅线结构同构。内置发票清晰度与抬头校验、收票信息 vs 附件分流（行程单双算预警）、跨组织挂票硬拦截、收票池账号可见性隔离、四条提交硬闸门（收票 0 行 / 无发票云流水号 / 跨组织 / 发票合计 < 报销额，无绕过参数）、按发票金额调低报销额（fit，唯一合规出路）、服务端上传发票并建收票单（员工零操作）、单一登录入口、提交前体检。适用于金蝶云星空（K3 Cloud）的费用报销、差旅报销、员工报销、发票挂单、提交审批场景。
 license: 小河狸非转售许可 1.0（企业内部使用免费，转售收费需授权）
 tags: [金蝶云星空, 费用报销, 差旅报销, 财务自动化, WebAPI, 发票]
 metadata:
-  version: 2.3.1
+  version: 2.3.2
   author: 小河狸工作室
   tags:
     - 金蝶云星空
@@ -61,6 +61,32 @@ python helpers/setup_credentials.py --check  # 只看状态，不开窗
 凭据用 **Windows DPAPI** 加密存到 `~/.workbuddy/kingdee/credentials.bin`：绑定当前 Windows 用户，
 同机其他用户读不出、拷到别的机器解不开、不在技能目录内（升级/打包不会带上）。
 
+**不用要求用户先装 Python 或 tkinter** —— 向导自己找路，全程零安装：
+
+| 层 | 行为 | 用户感受 |
+|---|---|---|
+| L0 | 当前解释器带 tkinter → 直接弹窗 | 无感 |
+| L1 | 没带 → 在本机找**已装的、带 tkinter 的另一个 Python**（py 启动器 / 注册表 / 安装目录），由它弹窗 | 无感，**不改系统 PATH** |
+| L2 | 一个都没有 → 自动转**文字向导**（独立新控制台窗口，密码走那个窗口自己的 stdin） | 一个黑窗口，能填 |
+| L3 | 都不行 → 如实告知，给"用户点确认后我才协助装"的可选动作 | 明确，不猜 |
+
+> 🚫 **禁止静默安装**任何运行时（Python / tkinter / .NET 组件）。
+> 理由：tkinter 不是 pip 包，装它等于**替换用户的 Python**；UAC、企业策略、离线、安全软件任一环节都能让它失败，
+> 并留下半装状态 —— 比"没装"更难诊断。要装必须用户明确同意，且装到用户目录、不接管默认 `python`。
+
+**退出码（按码判断结果，不要看有没有报错、也不要看输出文字）**
+
+| 码 | 含义 | agent 该做什么 |
+|---|---|---|
+| `0` | 已加密保存 | 继续原命令 |
+| `10` | 用户取消 / 关窗 / 20 分钟无操作自动关闭 | **没改成**：不要重跑；问一句"要不要再开一次"。注意此时若用户已改掉金蝶后台密码，本地仍是旧密码，**盲目重跑等于撞锁号** |
+| `12` | 已经有一个配置窗口开着 | 让用户在**那个**窗口填完，别开第二个 |
+| `2` | 环境不支持（非 Windows / 无 DPAPI / 界面全不可用） | 如实告知，给可选方案 |
+| `3` | 保存失败（窗口里已提示原因） | 把原因念给用户 |
+
+窗口本身的防错设计：有「显示」勾选可核对密码；`--change-key` 模式要求**输两次**（打错的代价是必然登录失败 + 撞锁号计数）；
+关窗前若有未保存内容会再确认一次；同一时间只允许一个配置窗口。
+
 > ⛔ **agent 行为约束**
 > 1. **绝不**要求用户在对话里提供金蝶/发票云的账号、密码或密钥 —— 让用户自己在弹窗里填。
 > 2. **绝不**代替用户把读到/听说的凭据写进任何文件（含明文配置）。历史上曾发生 agent 从截图读出凭据
@@ -95,15 +121,20 @@ python helpers/setup_credentials.py --check  # 只看状态，不开窗
 2. 用户说「需要修改密钥 / 改密码」时，**由你在后台运行** `python helpers/setup_credentials.py --change-key`
    （窗口弹在用户屏幕上，**不要阻塞等待**）。
 3. 用户说填完了 → `--check` 确认，看到「就绪状态 : ✅ 已用加密凭据，闸门放行」即可重跑原命令。
+4. 脚本退出码 `10` = 用户取消/关窗（**没改成**）→ 不要重跑业务命令，问一句"要不要再开一次窗口"；
+   `12` = 已经有一个配置窗开着 → 让他在那个窗填完；`2` = 环境不支持 → 按上表如实告知。
 
 ⛔ **绝不能**：让用户自己打开 `.py` 文件；让用户在对话里说出密码；替用户把密码写进任何文件。
 
 ### 1.3 其它配置方式
 
+**推荐顺序就是下面这个顺序（先保住"弹窗/向导"这条路，环境变量永远排最后）**：
+
 | 方式 | 做法 | 边界 |
 |---|---|---|
-| 配置向导（推荐） | `python helpers/setup_credentials.py` | 普通用户，明文不落盘 |
-| 环境变量 | `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | CI / 无人值守。**本地并不保密**（同用户其它进程可读、随子进程继承、进崩溃转储） |
+| 配置向导（首选） | `python helpers/setup_credentials.py` | 普通用户，明文不落盘。缺 tkinter 会自动换解释器 → 再转文字向导，**不需要用户装东西** |
+| 文字向导（自动降级） | `python helpers/setup_credentials.py --console` | 无图形界面机器；独立控制台窗口录入，密码不进对话记录 |
+| 环境变量 | `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | **仅** CI / 无人值守。**本地并不保密**（同用户其它进程可读、随子进程继承、进崩溃转储） |
 | 旧版明文 `config.json` | `{"base_url","acct_name","username","password"}` | 兼容保留但不推荐，会被闸门拦（见 1.2）；读到含密码时打印一次迁移提示，`KINGDEE_SILENCE_MIGRATION_HINT=1` 可静音 |
 | 导出技能的 `config.py` | —— | 无需操作，本 skill 同样兼容 |
 
@@ -432,7 +463,7 @@ org 105 这类**只用附件**的组织，跟随其既有做法走附件即可 �
 
 | 脚本 | 作用 |
 |---|---|
-| `helpers/setup_credentials.py` ★ | 配置向导：弹窗填公司名/用户名/密码；`--check` 看状态、`--delete` 清除、`--change-key` 改密钥。内置明文存量迁移 |
+| `helpers/setup_credentials.py` ★ | 配置向导：弹窗填公司名/用户名/密码；`--check` 看状态、`--delete` 清除、`--change-key` 改密钥、`--console` 强制文字向导。**缺 tkinter 自动换解释器 → 再转文字向导（零安装）**；退出码 0/10/12/2/3 需按码判读。内置明文存量迁移 |
 | `helpers/credstore.py` ★ | DPAPI 加密凭据存储（纯标准库 `ctypes`）；`describe()` 只回报字段名，永不回显值 |
 | `helpers/recvin_link.py` ★ | 核心：收票信息写入与提交。`find` / `list` / `resolve` / `link` / `clear` / `precheck` / `set-contact` / `submit` / `verify` / `upload` / `create-recvin` / `strict`；内置防抢关联、编辑锁重试、提交闸门 |
 | `helpers/expense_edit.py` ★ | 明细 ↔ 发票对齐与附件。`attach` / `set-detail` / `linkage` / `fit` / `download` / `check` |
