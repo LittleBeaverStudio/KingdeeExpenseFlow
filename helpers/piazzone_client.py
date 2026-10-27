@@ -189,9 +189,9 @@ def select_org(kingdee_org: str = "", org: str = "", org_name: str = "") -> dict
 
     三种指定方式（任选其一即可，越靠前优先级越高）::
 
-        piazzone_client.select_org(kingdee_org="104")            # 金蝶组织编码
-        piazzone_client.select_org(org_name="北京卓美医联科技有限公司")  # 金蝶组织名称（**推荐**）
-        piazzone_client.select_org(org="北京卓美医联科技有限公司")      # 组织名/税号/企业全称
+        piazzone_client.select_org(kingdee_org="104")                # 金蝶组织编码
+        piazzone_client.select_org(org_name="示例三科技")             # 金蝶组织名称（**推荐**）
+        piazzone_client.select_org(org="91110000XXXXXXXXXX")         # 组织名/税号/企业全称
 
     `org_name` 是与**购方企业全称**比对 —— 界面上不需要再单独维护「组织名」或
     「对应金蝶组织」，配了几家就按公司名自动对上（`recvin_link.upload_invoice`
