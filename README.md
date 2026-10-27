@@ -46,8 +46,9 @@ python helpers/setup_credentials.py
 - 🔒 绑当前 Windows 用户 —— 同机其它用户读不出，拷到别的机器也解不开
 - 🔒 不写明文文件、不进对话记录、不落日志（向导只回报字段名是否存在，永不回显值）
 - 🔒 在技能目录之外，升级 / 重装 / 打包都不会带上它
-- 🧩 **不要求你装任何东西**：本机 Python 没带图形界面时，会自动改用本机已装的另一个 Python 开窗；
-  一个都没有就转成文字向导（独立窗口录入，密码同样不进对话记录）。**全程不做静默安装。**
+- 🧩 **不要求你装任何东西**：本机 Python 没带图形界面时，会自动找本机已装的另一个 Python；
+  找不到就用**自带的原生 Windows 表单**（有输入框、密码框、显示密码）；
+  万一连表单都起不来，才转文字向导（独立窗口录入，密码同样不进对话记录）。**全程不做静默安装。**
 - ↩️ 窗口关掉 = 没有保存：向导会用退出码明确区分「已保存」和「你取消了」，不会把取消当成功。
 
 只看状态、不开窗：`python helpers/setup_credentials.py --check`
@@ -60,8 +61,9 @@ python helpers/setup_credentials.py
 
 | 情况 | 做法 | 边界 |
 |---|---|---|
-| 普通用户（推荐） | `python helpers/setup_credentials.py` | 明文不落盘，绑当前 Windows 用户。缺 tkinter 会自动换解释器 / 转文字向导 |
-| 机器没有任何图形界面 | 同上，向导自动转成文字向导（独立黑窗口） | 密码输在那个窗口里，不进对话记录 |
+| 普通用户（推荐） | `python helpers/setup_credentials.py` | 明文不落盘，绑当前 Windows 用户。缺 tkinter 会自动换解释器 → 原生表单 → 文字向导 |
+| 缺 tkinter 的机器 | 同上，自动改用内置原生表单 | 标准 Windows 控件，不装任何东西 |
+| 完全没有图形界面 | 同上，向导自动转成文字向导（独立黑窗口） | 密码输在那个窗口里，不进对话记录 |
 | CI / 无人值守 | 环境变量 `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | ⚠️ 环境变量不会被误提交进 git，但**本地并不保密**：同用户其它进程可读、会进日志与崩溃转储 |
 | 旧版明文写法（兼容保留，不推荐） | 写 `~/.workbuddy/kingdee/config.json` | 读到含密码时会提示迁移 |
 | 导出技能的 `config.py` 旧写法 | **无需操作**，同样兼容 | —— |

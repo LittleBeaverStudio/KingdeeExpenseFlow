@@ -31,13 +31,21 @@
 
 界面降级顺序（**零安装**，绝不静默装任何东西）
 ──────────────────────────────────────────
-  L0 本进程有 tkinter → 直接弹窗
+  L0 本进程有 tkinter → 弹窗（界面最好，带发票云多组织卡片）
   L1 本进程没有 → 到本机找**带 tkinter 的其它 Python**（py 启动器 / 注册表 / 安装目录），
      由它以 `--ui-child` 子进程弹窗。用户无感，也不改系统 PATH。
-  L2 一个都没有 → `--console-child` 在**新控制台窗口**里跑文字向导。
+  L2 **原生 Windows 表单**（`helpers/win32_form.py`，纯 ctypes 调 user32，见下）
+  L3 `--console-child` 在**新控制台窗口**里跑文字向导。
      ⚠️ 新控制台是关键：密码输在那个窗口自己的 stdin，**不进 agent 的管道**，
      所以不会出现在对话记录里。绝不能在原进程里 input()。
-  L3 都不行 → 如实回报，给「用户点确认后才协助安装」的可选动作；**不做静默安装**。
+  都不行 → 如实回报，给「用户点确认后才协助安装」的可选动作；**不做静默安装**。
+
+为什么要有 L2（原生表单）
+────────────────────────
+托管 Python 常不带 tkinter，而财务人员的办公电脑上多半没自己装过带 tkinter 的 Python ——
+若只有"tkinter 弹窗 / 黑窗口"两条路，大多数用户会落到黑窗口。`win32_form.py` 用 ctypes
+直接画标准 Windows 控件（EDIT / ES_PASSWORD / BUTTON），**既不依赖 tkinter 也不装任何东西**，
+所以"有输入框的窗口"这条路在 Windows 上是必然可用的。
 
 ⚠️ 实现注意（踩过的坑）
 ──────────────────────
@@ -59,6 +67,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -850,102 +859,150 @@ def _run_gui_inner(change_key: bool, tk, messagebox, ttk) -> int:
     return RESULT["code"] if RESULT["code"] is not None else EXIT_CANCELLED
 
 
-# ────────────────────────── 文字向导（无 tkinter 时的降级） ──────────────────────────
+# ────────────────────────── 文字向导（无图形界面时的降级） ──────────────────────────
+
+def _mask(pwd: str) -> str:
+    """只回报"填了几个字符"，绝不回报内容 —— 让用户能发现"少打/多打一位"。"""
+    n = len(pwd or "")
+    return "（已填写 %d 个字符）" % n if n else "（空）"
+
+
+def _pad(text: str, width: int) -> str:
+    """按**显示宽度**补空格（中文按 2 列算），否则摘要里冒号对不齐。"""
+    w = 0
+    for ch in text:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 1
+    return text + " " * max(width - w, 0)
+
 
 def _console_wizard(change_key: bool = False) -> int:
     """在新控制台窗口里跑的文字向导。
 
     ⚠️ 必须由 `--console-child` 在**独立控制台**里启动：密码走那个窗口自己的 stdin，
     不会经过 agent 的管道，所以不会出现在对话记录里。
+
+    交互上的三个刻意设计（都是踩过的坑）：
+      · 每项标 `[i/n]` —— 用户知道还剩几项，不会以为卡住；
+      · 密码项明说"输入不显示字符" —— 否则屏幕上毫无反应，用户会以为死机去点关闭；
+      · 保存前回显摘要 + 只显示密码**长度**，可按序号回填任一项 —— 打错一位不用从头再来。
     """
     pre = collect_prefill()
     legacy_has_secret = bool(str(_read_legacy_config().get("password") or "").strip())
-    pz_orgs, _active = _piazzone_state(pre.get("piazzone"))
+    saved = credstore.load() or {}
+    pz_orgs, pz_active = _piazzone_state(saved.get("piazzone") or pre.get("piazzone"))
+
+    steps = [
+        ["base_url", "服务器地址", str(pre.get("base_url") or ""), False],
+        ["acct_name", "公司名 / 账套", str(pre.get("acct_name") or ""), False],
+        ["username", "用户名", str(pre.get("username") or ""), False],
+        ["password", "新密码" if change_key else "密码", "", True],
+    ]
+    if change_key:
+        steps.append(["password2", "再输一次（防打错）", "", True])
 
     print("=" * 64)
     print("金蝶云星空 · 凭据录入（文字向导）")
     print("在这里输入的密码不会出现在对话里，也不会以明文存到磁盘。")
-    print("直接关掉这个窗口 = 放弃，不会保存任何内容。")
+    print("直接关掉这个窗口 = 放弃，不会保存任何内容；输 q 也可随时放弃。")
     print("=" * 64)
 
-    def ask(label: str, default: str = "", secret: bool = False) -> str | None:
+    values: dict = {}
+
+    def ask(i: int) -> str | None:
+        """问第 i 项；返回 None 表示用户放弃。"""
+        key, label, default, secret = steps[i]
+        print("")
+        if secret:
+            print("  [%d/%d] %s" % (i + 1, len(steps), label))
+            print("        输入时不显示任何字符（连星号也没有），输完按回车。")
+        else:
+            print("  [%d/%d] %s%s" % (i + 1, len(steps), label,
+                                      "" if not default else "（直接回车沿用 %s）" % default))
+            print("        （输 - 回上一项，输 q 放弃）")
         while True:
-            hint = "" if (secret or not default) else " [回车沿用 %s]" % default
             try:
                 if secret:
-                    val = getpass.getpass("  %s: " % label)
+                    val = getpass.getpass("  > ")
                 else:
-                    val = input("  %s%s: " % (label, hint))
+                    val = input("  > ")
             except (EOFError, KeyboardInterrupt):
                 return None
-            val = val if secret else val.strip()
-            if secret:
-                if val:
-                    return val
-            else:
-                if val:
-                    return val
-                if default:
+            if not secret:
+                val = val.strip()
+                if val.lower() == "q":
+                    return None
+                if val == "-":
+                    if i > 0:
+                        return {"__back__": True}
+                    print("    已经是第一项了。")
+                    continue
+                if not val and default:
                     return default
-            print("    ↑ 这一项必填。")
+            if val:
+                return val
+            print("    这一项必填，请重新输入。")
 
-    base_url = ask("服务器地址", str(pre.get("base_url") or ""))
-    if base_url is None:
-        print("\n已取消，未保存。")
-        return EXIT_CANCELLED
-    acct_name = ask("公司名 / 账套", str(pre.get("acct_name") or ""))
-    if acct_name is None:
-        print("\n已取消，未保存。")
-        return EXIT_CANCELLED
-    username = ask("用户名", str(pre.get("username") or ""))
-    if username is None:
-        print("\n已取消，未保存。")
-        return EXIT_CANCELLED
-    password = ask("新密码" if change_key else "密码", secret=True)
-    if password is None:
-        print("\n已取消，未保存。")
-        return EXIT_CANCELLED
-    again = ask("再输一次（防打错）", secret=True)
-    if again is None:
-        print("\n已取消，未保存。")
-        return EXIT_CANCELLED
-    if password != again:
-        print("\n两次输入不一致，未保存。请重新运行再填一次。")
+    i = 0
+    while i < len(steps):
+        got = ask(i)
+        if got is None:
+            print("\n已取消，没有保存任何内容。")
+            return EXIT_CANCELLED
+        if isinstance(got, dict) and got.get("__back__"):
+            i = max(i - 1, 0)
+            continue
+        values[steps[i][0]] = got
+        i += 1
+
+    def summary() -> None:
+        print("")
+        print("  即将保存（密码不显示内容，只显示长度）：")
+        for n, (key, label, _d, _s) in enumerate(steps, start=1):
+            val = values.get(key, "")
+            shown = _mask(val) if key in ("password", "password2") else (val or "（空）")
+            print("    %d) %s: %s" % (n, _pad(label, 22), shown))
+
+    while True:
+        summary()
+        try:
+            ans = input("\n  回车 = 确认保存     数字 = 重填该项     q = 放弃： ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消，没有保存任何内容。")
+            return EXIT_CANCELLED
+        if ans.lower() == "q":
+            print("已取消，没有保存任何内容。")
+            return EXIT_CANCELLED
+        if not ans:
+            # 改密钥时两次不一致 —— 不退出，回到摘要让用户按序号改正（比从头再填友好得多）
+            if change_key and values.get("password") != values.get("password2"):
+                print("\n  ⚠️ 两次输入的密码不一样，还没有保存。")
+                print("     请用序号重填「新密码」和「再输一次」，两遍一致才会保存。")
+                continue
+            break
+        if ans.isdigit() and 1 <= int(ans) <= len(steps):
+            j = int(ans) - 1
+            got = ask(j)
+            if got is None:
+                print("\n已取消，没有保存任何内容。")
+                return EXIT_CANCELLED
+            if isinstance(got, dict) and got.get("__back__"):
+                continue
+            values[steps[j][0]] = got
+            continue
+        print("  （只认回车、序号或 q）")
+
+    if change_key and values.get("password") != values.get("password2"):
+        print("\n两次输入的密码不一样 —— 没有保存。")
         return EXIT_CANCELLED
 
-    payload = {"base_url": base_url, "acct_name": acct_name,
-               "username": username, "password": password}
+    payload = {"base_url": values["base_url"], "acct_name": values["acct_name"],
+               "username": values["username"], "password": values["password"]}
     if str(pre.get("acctid") or "").strip():
         payload["acctid"] = str(pre["acctid"]).strip()
 
-    # 发票云（可选）
-    saved_orgs = dict(pz_orgs or {})
-    if saved_orgs:
-        print("\n发票云：当前已保存 %d 家。" % len(saved_orgs))
-        ans = input("  要重新维护这一组吗？(y/N): ").strip().lower()
-    else:
-        ans = input("\n发票云（可选，仅验票/服务端上传才需要）现在配置吗？(y/N): ").strip().lower()
-
-    rows: list = []
-    if ans == "y":
-        print("  一家一家填，购方企业全称留空表示结束。")
-        while True:
-            name = input("    购方企业全称（留空结束）: ").strip()
-            if not name:
-                break
-            tax_no = input("    购方税号: ").strip()
-            cid = input("    client_id: ").strip()
-            csec = getpass.getpass("    client_secret: ")
-            rows.append({"ghf_mc": name, "tax_no": tax_no,
-                         "client_id": cid, "client_secret": csec})
-        orgs, active = _orgs_from_rows(rows)
-        pz = _piazzone_payload(orgs, active)
-        if pz:
-            payload["piazzone"] = pz
-    elif saved_orgs:
-        pz = _piazzone_payload(saved_orgs, _active)
-        if pz:
-            payload["piazzone"] = pz
+    pz = _ask_piazzone(pz_orgs, pz_active)
+    if pz:
+        payload["piazzone"] = pz
 
     ok, err, notes = _save_payload(payload)
     if not ok:
@@ -964,7 +1021,144 @@ def _console_wizard(change_key: bool = False) -> int:
     return EXIT_OK
 
 
+def _ask_piazzone(saved_orgs: dict, active: str, force: bool = False) -> dict:
+    """问发票云；返回要保存的 piazzone 结构（空 dict = 不写这一组）。
+
+    `force=True` 时不问"要不要维护"，直接进入逐家填写（用户已经明确选了要改）。
+    """
+    saved_orgs = saved_orgs or {}
+    if not force:
+        if saved_orgs:
+            print("\n  发票云：已保存 %d 家（%s）"
+                  % (len(saved_orgs), "、".join(list(saved_orgs)[:3])))
+            try:
+                ans = input("  要重新维护这一组吗？不改就回车。(y/N): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            if ans != "y":
+                return _piazzone_payload(saved_orgs, active)   # 原样保留
+        else:
+            try:
+                ans = input("\n  发票云（可选，仅验票/服务端上传才需要）现在配置吗？(y/N): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            if ans != "y":
+                return {}
+
+    print("  一家一家填：购方企业全称留空表示结束（至少填一家）。")
+    rows: list = []
+    while True:
+        try:
+            name = input("    购方企业全称: ").strip()
+            if not name:
+                if rows:
+                    break
+                print("    还没有填过任何一家 —— 再填一次，或直接关窗口放弃。")
+                continue
+            tax_no = input("    购方税号: ").strip()
+            cid = input("    client_id: ").strip()
+            csec = getpass.getpass("    client_secret（输入不显示）: ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        rows.append({"ghf_mc": name, "tax_no": tax_no, "client_id": cid,
+                     "client_secret": csec})
+
+    orgs, new_active = _orgs_from_rows(rows)
+    pz = _piazzone_payload(orgs, new_active)
+    if not pz and saved_orgs:
+        print("  没有填完整（client_id 为空会被忽略），发票云保持原样。")
+        return _piazzone_payload(saved_orgs, active)
+    return pz
+
+
+def _piazzone_only_wizard() -> int:
+    """只维护发票云（原生表单里勾了「同时维护发票云」后由它接手）。"""
+    data = credstore.load() or {}
+    if not (data.get("username") and data.get("password")):
+        print("还没配置金蝶凭据 —— 请先跑一次完整的凭据录入。")
+        return EXIT_UNSUPPORTED
+    orgs, active = _piazzone_state(data.get("piazzone"))
+    print("=" * 64)
+    print("金蝶云星空 · 发票云维护（文字向导）")
+    print("只改这一组，金蝶连接的凭据原样保留。")
+    print("=" * 64)
+    pz = _ask_piazzone(orgs, active, force=True)
+    if pz:
+        data["piazzone"] = pz
+    ok, err, notes = _save_payload(data)
+    if not ok:
+        print("\n❌ 保存失败：%s" % err)
+        return EXIT_SAVE_FAILED
+    print("")
+    for line in notes:
+        print("✓ " + line)
+    try:
+        input("\n按回车关闭这个窗口…")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return EXIT_OK
+
+
 # ─────────────────────────────── 启动器 ───────────────────────────────
+
+def _native_form(change_key: bool) -> int:
+    """L2：原生 Windows 表单（纯 ctypes，不依赖 tkinter）。
+
+    返回 EXIT_NEED_FALLBACK 表示这条路走不通，让调用方继续降级。
+    """
+    try:
+        import win32_form as wf
+    except Exception as exc:  # noqa: BLE001
+        print("原生表单不可用（%s）。" % exc)
+        return EXIT_NEED_FALLBACK
+    if not wf.available():
+        return EXIT_NEED_FALLBACK
+
+    if not _acquire_lock():
+        print("已经有一个凭据配置窗口开着。请在那个窗口里填完，不要再开第二个。")
+        return EXIT_BUSY
+    try:
+        pre = collect_prefill()
+        legacy_has_secret = bool(str(_read_legacy_config().get("password") or "").strip())
+        saved = credstore.load() or {}
+        orgs, active = _piazzone_state(saved.get("piazzone"))
+        try:
+            got = wf.run_form(change_key=change_key,
+                              prefill={"base_url": pre.get("base_url") or "",
+                                       "acct_name": pre.get("acct_name") or "",
+                                       "username": pre.get("username") or ""},
+                              has_piazzone=bool(orgs))
+        except Exception as exc:  # noqa: BLE001
+            print("原生表单创建失败（%s: %s）。" % (type(exc).__name__, exc))
+            return EXIT_NEED_FALLBACK
+        if got is None:
+            print("用户取消了录入（没有保存任何内容）。")
+            return EXIT_CANCELLED
+
+        payload = {"base_url": got["base_url"], "acct_name": got["acct_name"],
+                   "username": got["username"], "password": got["password"]}
+        if str(pre.get("acctid") or "").strip():
+            payload["acctid"] = str(pre["acctid"]).strip()
+        pz = _piazzone_payload(orgs, active)          # 没勾「维护发票云」就原样保留
+        if pz:
+            payload["piazzone"] = pz
+
+        ok, err, notes = _save_payload(payload)
+        if not ok:
+            wf.message("保存失败：\n%s" % err, "保存失败", warning=True)
+            return EXIT_SAVE_FAILED
+        if legacy_has_secret:
+            notes.append("提醒：请确认已在金蝶后台改掉旧密码。")
+        want_pz = bool(got.get("want_piazzone"))
+        if want_pz:
+            notes.append("接下来会另开一个窗口维护发票云（只改这一组）。")
+        wf.message("\n".join(notes), "完成")
+        if want_pz:
+            return _relaunch([sys.executable], "--piazzone-child", False)
+        return EXIT_OK
+    finally:
+        _release_lock()
+
 
 def _try_ui(change_key: bool) -> int | None:
     """弹窗；建不起来（或中途异常）返回 None，交给上层降级 —— 绝不把 traceback 喷给用户。"""
@@ -1004,8 +1198,11 @@ def main() -> int:
     ap.add_argument("--change-key", dest="change_key", action="store_true",
                     help="「修改密钥」模式开窗")
     ap.add_argument("--console", action="store_true", help="强制文字向导（排障用）")
+    ap.add_argument("--native", action="store_true", help="强制原生表单（排障用）")
     ap.add_argument("--ui-child", dest="ui_child", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--console-child", dest="console_child", action="store_true",
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--piazzone-child", dest="piazzone_child", action="store_true",
                     help=argparse.SUPPRESS)
     a = ap.parse_args()
 
@@ -1018,7 +1215,14 @@ def main() -> int:
         orgs, active = _piazzone_state(data.get("piazzone"))
         print("加密凭据文件 :", credstore.STORE_PATH, "存在" if credstore.exists() else "不存在")
         print("加密凭据内容 :", credstore.describe())
-        print("图形界面     :", "可用" if _has_tkinter() else "当前解释器没有 tkinter（会自动另找）")
+        try:
+            import win32_form as _wf
+            native_ok = _wf.available()
+        except Exception:  # noqa: BLE001
+            native_ok = False
+        print("录入界面     : tkinter=%s ｜ 原生表单=%s ｜ 文字向导=是"
+              % ("有" if _has_tkinter() else "无（会自动另找解释器）",
+                 "可用" if native_ok else "不可用"))
         if orgs:
             print("发票云组织   : %d 家（active=%s）" % (len(orgs), active or "-"))
             for _n, _v in orgs.items():
@@ -1050,8 +1254,12 @@ def main() -> int:
         return EXIT_NEED_FALLBACK if code is None else code
     if a.console_child or a.console:
         return _console_wizard(change_key=a.change_key)
+    if a.piazzone_child:
+        return _piazzone_only_wizard()
+    if a.native:
+        return _native_form(a.change_key)
 
-    # L0：当前解释器就能弹窗
+    # L0：当前解释器就能弹窗（tkinter 版界面最好，还带发票云多组织卡片）
     if _has_tkinter():
         code = _try_ui(a.change_key)
         if code is not None:
@@ -1066,8 +1274,13 @@ def main() -> int:
         if code != EXIT_NEED_FALLBACK:
             return code
 
-    # L2：文字向导（独立控制台，密码不进对话）
-    print("本机没有可用的图形界面，改用文字向导：马上会弹出一个黑色的录入窗口，")
+    # L2：原生 Windows 表单（ctypes 自绘，不依赖 tkinter，任何 Windows 都能跑）
+    code = _native_form(a.change_key)
+    if code != EXIT_NEED_FALLBACK:
+        return code
+
+    # L3：文字向导（独立控制台，密码不进对话）
+    print("改用文字向导：马上会弹出一个黑色的录入窗口，")
     print("请在**那个窗口**里按提示填写（密码不会出现在这里）。")
     return _relaunch([sys.executable], "--console-child", a.change_key)
 
