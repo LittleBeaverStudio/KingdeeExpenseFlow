@@ -221,6 +221,7 @@ if not CLIENT_ID or CLIENT_ID.startswith("请填"):
         "❌ 未配置发票云凭证（本模块是**可选**功能）。\n"
         "   方式一（推荐）：运行配置向导，填「可选：发票云」那一组\n"
         "       python helpers/setup_credentials.py\n"
+        "       （只补发票云、不动金蝶凭据：python helpers/setup_credentials.py --piazzone-child）\n"
         "       （凭据经 Windows 系统加密保存，明文不落盘、不进对话）\n"
         "   方式二：设环境变量 PIAZZONE_CLIENT_ID / PIAZZONE_CLIENT_SECRET / PIAZZONE_TAX_NO / PIAZZONE_GHF_MC\n"
         "   方式三：复制 helpers/piazzone_config.example.py 为 helpers/piazzone_config.py 并填写（明文，不推荐）\n"
