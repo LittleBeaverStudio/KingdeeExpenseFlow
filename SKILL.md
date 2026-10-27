@@ -2,13 +2,13 @@
 name: kingdee-expense-flow
 slug: kingdee-expense-flow
 displayName: 金蝶云星空报销助手
-version: 2.3.4
+version: 2.3.5
 summary: 小河狸工作室出品：金蝶云星空费用/差旅报销全流程提交，员工不登录金蝶也能报销。
 description: 小河狸工作室出品。金蝶云星空「费用/差旅报销全流程」提交 Skill：员工无需登录金蝶，在对话里把发票交上来，agent 用纯 WebAPI 完成「费用申请单 → 下推报销单 → 挂收票信息／传附件 → 提交审批」，差旅线结构同构。内置发票清晰度与抬头校验、收票信息 vs 附件分流（行程单双算预警）、跨组织挂票硬拦截、收票池账号可见性隔离、四条提交硬闸门（收票 0 行 / 无发票云流水号 / 跨组织 / 发票合计 < 报销额，无绕过参数）、按发票金额调低报销额（fit，唯一合规出路）、服务端上传发票并建收票单（员工零操作）、单一登录入口、提交前体检。适用于金蝶云星空（K3 Cloud）的费用报销、差旅报销、员工报销、发票挂单、提交审批场景。
 license: 小河狸非转售许可 1.0（企业内部使用免费，转售收费需授权）
 tags: [金蝶云星空, 费用报销, 差旅报销, 财务自动化, WebAPI, 发票]
 metadata:
-  version: 2.3.4
+  version: 2.3.5
   author: 小河狸工作室
   tags:
     - 金蝶云星空
@@ -51,15 +51,27 @@ metadata:
 python -m pip install -r requirements.txt    # 仅 Excel/分析类辅助用到，核心写票零依赖
 ```
 
-### 1.1 配置连接（推荐向导，明文不落盘）
+### 1.1 配置连接（**金蝶连接归导出技能，发票云归本技能**）
+
+本技能要两类凭据，**分两个加密文件、各有唯一写入者**，谁也不会把谁的配置冲掉：
+
+| 凭据 | 文件 | 谁写 | 内容 |
+|---|---|---|---|
+| 金蝶连接 | `~/.workbuddy/kingdee/credentials.bin` | **只有导出技能**（`kingdee-data-exporter` 的 `setup_credentials.py`） | `base_url / acct_name / username / password / acctid` |
+| 发票云 | `~/.workbuddy/kingdee/piazzone.bin` | **只有本技能** | `orgs / active`（多家公司各一组 client_id / secret / 税号） |
+
+两个文件都用 **Windows DPAPI** 加密：绑当前 Windows 用户，同机其他用户读不出、拷到别的机器解不开。
 
 ```bash
-python helpers/setup_credentials.py          # 弹窗填 公司名 / 用户名 / 密码
-python helpers/setup_credentials.py --check  # 只看状态，不开窗
+python helpers/setup_credentials.py            # 只维护发票云（金蝶连接已配好时走这条）
+python helpers/setup_credentials.py --piazzone # 同上，显式写法
+python helpers/setup_credentials.py --check    # 只看状态，不开窗
+python helpers/setup_credentials.py --full     # 连金蝶连接一起录（**只装了本技能**时才用）
 ```
 
-凭据用 **Windows DPAPI** 加密存到 `~/.workbuddy/kingdee/credentials.bin`：绑定当前 Windows 用户，
-同机其他用户读不出、拷到别的机器解不开、不在技能目录内（升级/打包不会带上）。
+> 📌 **改金蝶密码不要在本技能里改** —— 让用户跑导出技能的
+> `python setup_credentials.py --change-key`（一份凭据只有一个入口，改完两边都生效）。
+> 本技能检测到已装导出技能时会直接这样提示；没装才允许在这里改（加 `--full`）。
 
 **不用要求用户先装 Python 或 tkinter** —— 向导自己找路，全程零安装：
 
@@ -67,7 +79,8 @@ python helpers/setup_credentials.py --check  # 只看状态，不开窗
 |---|---|---|
 | L0 | 当前解释器带 tkinter → 弹窗（界面最好，带发票云多组织卡片） | 无感 |
 | L1 | 没带 → 在本机找**已装的、带 tkinter 的另一个 Python**（py 启动器 / 注册表 / 安装目录），由它弹窗 | 无感，**不改系统 PATH** |
-| L2 | 还是没有 → **原生 Windows 表单**（`helpers/win32_form.py`，纯 ctypes 画标准控件：输入框 / 密码框 / 复选框 / 按钮） | **有输入框的正常窗口**，任何 Windows 都有 || L3 | 表单也起不来（极少见）→ 自动转**文字向导**（独立新控制台窗口，密码走那个窗口自己的 stdin） | 一个黑窗口，能填 |
+| L2 | 还是没有 → **原生 Windows 表单**（`helpers/win32_form.py`，纯 ctypes 画标准控件：输入框 / 密码框 / 复选框 / 按钮） | **有输入框的正常窗口**，任何 Windows 都有 |
+| L3 | 表单也起不来（极少见）→ 自动转**文字向导**（独立新控制台窗口，密码走那个窗口自己的 stdin） | 一个黑窗口，能填 |
 | — | 都不行 → 如实告知，给"用户点确认后我才协助装"的可选动作 | 明确，不猜 |
 
 > 为什么必须自带 L2：托管 Python 常不带 tkinter，而财务人员的办公电脑上多半没自己装过带 tkinter 的 Python ——
@@ -87,7 +100,7 @@ python helpers/setup_credentials.py --check  # 只看状态，不开窗
 | `0` | 已加密保存 | 继续原命令 |
 | `10` | 用户取消 / 关窗 / 20 分钟无操作自动关闭 | **没改成**：不要重跑；问一句"要不要再开一次"。注意此时若用户已改掉金蝶后台密码，本地仍是旧密码，**盲目重跑等于撞锁号** |
 | `12` | 已经有一个配置窗口开着 | 让用户在**那个**窗口填完，别开第二个 |
-| `2` | 环境不支持（非 Windows / 无 DPAPI / 界面全不可用） | 如实告知，给可选方案 |
+| `2` | 环境不支持（非 Windows / 无 DPAPI / 界面全不可用 / 缺金蝶连接凭据） | 如实告知，给可选方案 |
 | `3` | 保存失败（窗口里已提示原因） | 把原因念给用户 |
 
 窗口本身的防错设计：有「显示密码」勾选可核对密码；`--change-key` 模式要求**输两次**（打错的代价是必然登录失败 + 撞锁号计数）；
@@ -100,8 +113,12 @@ python helpers/setup_credentials.py --check  # 只看状态，不开窗
 >    后落盘成 `piazzone_config.py`，这属于不该有的行为。
 > 3. 需要凭据时，正确动作是**提示用户运行向导**，再用 `--check` 确认就绪（只回报字段名，不回显值）。
 
+**旧版怎么迁上来的**：早期版本把 `piazzone` 段塞在 `credentials.bin` 里，导出技能一改密码就整段被冲掉。
+现在向导启动时会**自动迁移**：先把旧文件备份成 `credentials.bin.bak-<时间戳>`，把发票云写进 `piazzone.bin`，
+再从旧文件里删掉那一段（金蝶凭据原样保留）。读取侧两种位置都兼容，没迁移也能用。
+
 **为什么不复用导出技能的登录**：导出技能是只读的，不提供写接口；本 skill 必须自己登录，
-但读的是**同一份配置**，用户不需要多填任何东西。
+但读的是**同一份** `credentials.bin`，用户不需要多填任何东西。
 
 ### 1.2 明文配置会被强制阻断
 
@@ -125,8 +142,10 @@ python helpers/setup_credentials.py --check  # 只看状态，不开窗
    文件能删，但『曾被明文保存』这件事撤不回来。改完跟我说一声『**需要修改密钥**』，
    我给你弹个窗口录新密码，保存后旧的明文文件会自动删掉。」
    若用户问"既然会自动删，还改密码干嘛"，按上表回答：**改密码管"已经明文过"，删文件管"以后"**。
-2. 用户说「需要修改密钥 / 改密码」时，**由你在后台运行** `python helpers/setup_credentials.py --change-key`
+2. 用户说「需要修改密钥 / 改密码」时，**金蝶密码交给导出技能**（一份凭据只有一个写入者）：
+   在后台运行**导出技能目录**里的 `python setup_credentials.py --change-key`
    （窗口弹在用户屏幕上，**不要阻塞等待**）。
+   只有本机没装导出技能时，才用 `python helpers/setup_credentials.py --change-key --full` 兜底。
 3. 用户说填完了 → `--check` 确认，看到「就绪状态 : ✅ 已用加密凭据，闸门放行」即可重跑原命令。
 4. 脚本退出码 `10` = 用户取消/关窗（**没改成**）→ 不要重跑业务命令，问一句"要不要再开一次窗口"；
    `12` = 已经有一个配置窗开着 → 让他在那个窗填完；`2` = 环境不支持 → 按上表如实告知。
@@ -139,9 +158,11 @@ python helpers/setup_credentials.py --check  # 只看状态，不开窗
 
 | 方式 | 做法 | 边界 |
 |---|---|---|
-| 配置向导（首选） | `python helpers/setup_credentials.py` | 普通用户，明文不落盘。缺 tkinter 会自动换解释器 → 原生表单 → 文字向导，**不需要用户装东西** |
-| 原生表单（自动降级） | 同上，自动触发；排障可 `--native` 强制 | 纯 ctypes 画的 Windows 标准控件，无任何依赖 |
-| 文字向导（自动降级） | `python helpers/setup_credentials.py --console` | 无图形界面机器；独立控制台窗口录入，密码不进对话记录 |
+| **金蝶连接**（推荐） | 用**导出技能**的 `python setup_credentials.py` | 一份凭据一个入口；缺 tkinter 会自动换解释器 → 原生表单 → 文字向导，**不需要用户装东西** |
+| **发票云**（本技能） | `python helpers/setup_credentials.py --piazzone` | 存独立文件 `piazzone.bin`，不动金蝶凭据 |
+| 两者一起录（兜底） | `python helpers/setup_credentials.py --full` | **只装了本技能**时用；装了导出技能就别用，免得两个入口 |
+| 原生表单（自动降级） | 自动触发；排障可 `--native` 强制 | 纯 ctypes 画的 Windows 标准控件，无任何依赖 |
+| 文字向导（自动降级） | `--console` / 自动降级 | 无图形界面机器；独立控制台窗口录入，密码不进对话记录 |
 | 环境变量 | `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | **仅** CI / 无人值守。**本地并不保密**（同用户其它进程可读、随子进程继承、进崩溃转储） |
 | 旧版明文 `config.json` | `{"base_url","acct_name","username","password"}` | 兼容保留但不推荐，会被闸门拦（见 1.2）；读到含密码时打印一次迁移提示，`KINGDEE_SILENCE_MIGRATION_HINT=1` 可静音 |
 | 导出技能的 `config.py` | —— | 无需操作，本 skill 同样兼容 |
@@ -472,6 +493,7 @@ org 105 这类**只用附件**的组织，跟随其既有做法走附件即可 �
 | 脚本 | 作用 |
 |---|---|
 | `helpers/setup_credentials.py` ★ | 配置向导：弹窗填公司名/用户名/密码；`--check` 看状态、`--delete` 清除、`--change-key` 改密钥、`--native` 强制原生表单、`--console` 强制文字向导。**缺 tkinter 自动换解释器 → 原生表单 → 文字向导（全程零安装）**；退出码 0/10/12/2/3 需按码判读。内置明文存量迁移 |
+| `helpers/piazzone_store.py` ★ | 发票云凭据的**独立**加密存储（`piazzone.bin`）；含旧数据迁移：把 `credentials.bin` 里遗留的 `piazzone` 段搬过来（先备份） |
 | `helpers/win32_form.py` ★ | 原生 Windows 表单（纯 `ctypes` 调 user32/gdi32，无任何依赖）：输入框 / 密码框（`ES_PASSWORD` + 显示密码）/ 复选框 / 按钮；高 DPI 自适应、输入法组词时不吃回车 |
 | `helpers/credstore.py` ★ | DPAPI 加密凭据存储（纯标准库 `ctypes`）；`describe()` 只回报字段名，永不回显值 |
 | `helpers/recvin_link.py` ★ | 核心：收票信息写入与提交。`find` / `list` / `resolve` / `link` / `clear` / `precheck` / `set-contact` / `submit` / `verify` / `upload` / `create-recvin` / `strict`；内置防抢关联、编辑锁重试、提交闸门 |

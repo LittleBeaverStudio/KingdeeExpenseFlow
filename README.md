@@ -51,6 +51,22 @@ python helpers/setup_credentials.py
   万一连表单都起不来，才转文字向导（独立窗口录入，密码同样不进对话记录）。**全程不做静默安装。**
 - ↩️ 窗口关掉 = 没有保存：向导会用退出码明确区分「已保存」和「你取消了」，不会把取消当成功。
 
+**两类凭据分两个文件、各有唯一写入者**（互不覆盖）：
+
+| 凭据 | 文件 | 谁写 |
+|---|---|---|
+| 金蝶连接（服务器/账套/用户名/密码） | `~/.workbuddy/kingdee/credentials.bin` | **只有导出技能**（推荐用它配） |
+| 发票云（client_id/secret/税号） | `~/.workbuddy/kingdee/piazzone.bin` | **只有本技能** |
+
+```bash
+python helpers/setup_credentials.py --piazzone   # 只维护发票云（金蝶连接已配好时）
+python helpers/setup_credentials.py --full       # 连金蝶连接一起录（只装了本技能时才用）
+```
+
+改金蝶密码请用导出技能的 `python setup_credentials.py --change-key` —— 一份凭据只有一个入口，
+改完两边都生效。早期版本把发票云塞在 `credentials.bin` 里，导出技能改密码会把它冲掉；
+现在向导启动时会自动迁移到 `piazzone.bin`（旧文件先备份成 `.bak-<时间戳>`）。
+
 只看状态、不开窗：`python helpers/setup_credentials.py --check`
 
 如果已经装好并配置过
@@ -61,7 +77,7 @@ python helpers/setup_credentials.py
 
 | 情况 | 做法 | 边界 |
 |---|---|---|
-| 普通用户（推荐） | `python helpers/setup_credentials.py` | 明文不落盘，绑当前 Windows 用户。缺 tkinter 会自动换解释器 → 原生表单 → 文字向导 |
+| 普通用户（推荐） | 金蝶连接用导出技能的向导；发票云用 `helpers/setup_credentials.py --piazzone` | 明文不落盘，绑当前 Windows 用户。缺 tkinter 会自动换解释器 → 原生表单 → 文字向导 |
 | 缺 tkinter 的机器 | 同上，自动改用内置原生表单 | 标准 Windows 控件，不装任何东西 |
 | 完全没有图形界面 | 同上，向导自动转成文字向导（独立黑窗口） | 密码输在那个窗口里，不进对话记录 |
 | CI / 无人值守 | 环境变量 `KINGDEE_BASE_URL` / `KINGDEE_ACCTID`（或 `KINGDEE_ACCT_NAME`）/ `KINGDEE_USERNAME` / `KINGDEE_PASSWORD` | ⚠️ 环境变量不会被误提交进 git，但**本地并不保密**：同用户其它进程可读、会进日志与崩溃转储 |

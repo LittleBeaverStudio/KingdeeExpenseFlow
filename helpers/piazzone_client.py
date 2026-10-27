@@ -67,7 +67,18 @@ def _split_orgs(raw) -> list:
 
 
 def _load_raw_piazzone():
-    """读加密存储里的 `piazzone` 段（读不到返回 None）。"""
+    """读发票云凭据段（读不到返回 None）。
+
+    读取顺序：`piazzone.bin`（新，报销助手独占） → `credentials.bin` 里的遗留 `piazzone` 段。
+    后者只为兼容旧版本；向导启动时会自动迁移并删掉旧键。
+    """
+    try:
+        import piazzone_store as _ps
+        pz = _ps.load()
+        if pz:
+            return pz
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import credstore as _cs  # 同目录，纯标准库
         return (_cs.load() or {}).get("piazzone") if _cs.available() else None

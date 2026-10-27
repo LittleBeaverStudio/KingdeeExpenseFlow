@@ -395,8 +395,11 @@ def message(text: str, title: str = "提示", warning: bool = False) -> None:
 
 
 def run_form(change_key: bool = False, prefill: dict | None = None,
-             has_piazzone: bool = False) -> dict | None:
-    """弹出原生表单。返回填写结果；取消返回 None。"""
+             has_piazzone: bool = False, show_piazzone: bool = True) -> dict | None:
+    """弹出原生表单。返回填写结果；取消返回 None。
+
+    `show_piazzone=False` 用于导出技能那份向导（它不管发票云）。
+    """
     if not available():
         raise OSError("原生表单仅支持 Windows")
 
@@ -442,7 +445,8 @@ def run_form(change_key: bool = False, prefill: dict | None = None,
     y_show = y
     y += s(24) + s(12)
     y_pz = y
-    y += s(24) + s(12)
+    if show_piazzone:
+        y += s(24) + s(12)
     y_hint = y
     y += s(20) + s(10)
     y_btn = y
@@ -647,12 +651,13 @@ def run_form(change_key: bool = False, prefill: dict | None = None,
     state["checks"]["show"] = chk_show
 
     # 发票云（勾了才在保存后走文字向导维护；不勾 = 原样保留已存的配置）
-    pz_label = ("同时维护发票云（已存的会保留，不改就别勾）" if has_piazzone
-                else "同时维护发票云（可选，仅验票/服务端上传需要）")
-    chk_pz = add("BUTTON", pz_label,
-                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                 s(MARGIN), y_pz, s(client_w - MARGIN * 2), s(24), ID_WANT_PZ, font)
-    state["checks"]["piazzone"] = chk_pz
+    if show_piazzone:
+        pz_label = ("同时维护发票云（已存的会保留，不改就别勾）" if has_piazzone
+                    else "同时维护发票云（可选，仅验票/服务端上传需要）")
+        chk_pz = add("BUTTON", pz_label,
+                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                     s(MARGIN), y_pz, s(client_w - MARGIN * 2), s(24), ID_WANT_PZ, font)
+        state["checks"]["piazzone"] = chk_pz
 
     # 提示（长度要能塞进一行，否则会被窗口右边界切掉）
     add("STATIC", "密码连错 5 次会锁账号 —— 建议勾上「显示密码」先核对。",
@@ -698,7 +703,7 @@ def run_form(change_key: bool = False, prefill: dict | None = None,
             return
         state["done"] = {"base_url": base_url, "acct_name": acct_name,
                          "username": username, "password": password,
-                         "want_piazzone": bool(state["check"]["piazzone"])}
+                         "want_piazzone": bool(state["check"].get("piazzone"))}
         _USER32.DestroyWindow(ctypes.c_void_p(hwnd_))
 
     _USER32.ShowWindow(ctypes.c_void_p(hwnd), SW_SHOW)

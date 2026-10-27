@@ -73,9 +73,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import credstore  # noqa: E402
+import piazzone_store  # noqa: E402
 
 LEGACY_CONFIG = Path.home() / ".workbuddy" / "kingdee" / "config.json"
 PIAZZONE_DEFAULT_BASE = "https://api.piaozone.com"
+
+_UNSET = object()          # `_save_payload(piazzone=_UNSET)` = 不碰发票云那一份
 
 # ── 退出码（agent 按码判断，别按输出文字猜）──
 EXIT_OK = 0
@@ -154,7 +157,33 @@ def collect_prefill() -> dict:
     saved = credstore.load()
     if saved:
         pre.update({k: v for k, v in saved.items() if v})
+    pz = load_piazzone()                     # 发票云在独立文件里，别从 credentials.bin 找
+    if pz:
+        pre["piazzone"] = pz
     return pre
+
+
+def load_piazzone() -> dict | None:
+    """读发票云那一份：`piazzone.bin` 优先，其次 credentials.bin 里的遗留段。"""
+    try:
+        pz = piazzone_store.load()
+        if pz:
+            return pz
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return (credstore.load() or {}).get("piazzone")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def exporter_present() -> bool:
+    """本机是否装了导出技能（决定金蝶凭据由谁写）。"""
+    for cand in _EXPORTER_CANDIDATES:
+        if (Path(cand) / "config.example.py").is_file() or \
+           (Path(cand) / "data_exporter.py").is_file():
+            return True
+    return False
 
 
 def _lookup_acct_name(base_url: str, acctid: str, timeout: int = 8) -> str:
@@ -438,15 +467,37 @@ def _orgs_from_rows(rows: list) -> tuple:
     return out, next(iter(out), "")
 
 
-def _save_payload(payload: dict) -> tuple[bool, str, list[str]]:
-    """统一落盘：加密保存 → 删旧明文 → 给用户看的提示行。"""
+def _save_payload(payload: dict, piazzone=_UNSET) -> tuple[bool, str, list[str]]:
+    """统一落盘。
+
+    · **金蝶连接凭据** → `credentials.bin`，**合并写**（只覆盖本次这几个键，
+      不把别处写进去的内容整份冲掉 —— 这就是"用导出技能改密码，发票云配置消失"那个坑的修法）
+    · **发票云凭据** → `piazzone.bin`（独立文件）；传 `piazzone=_UNSET` 表示这次不动它
+    """
+    data = credstore.load() or {}
+    data.pop("piazzone", None)          # 旧版本遗留段：迁移到独立文件后不再写回此处
+    data.update({k: v for k, v in payload.items() if k != "piazzone"})
     try:
-        credstore.save(payload)
+        credstore.save(data)
     except Exception as exc:  # noqa: BLE001
         return False, str(exc), []
-    notes = ["凭据已加密保存。"]
-    if payload.get("piazzone"):
-        notes.append("发票云：已保存 %d 家。" % len(payload["piazzone"]["orgs"]))
+
+    notes = ["金蝶连接凭据已加密保存。"]
+    if piazzone is not _UNSET:
+        try:
+            if piazzone:
+                piazzone_store.save(piazzone)
+                notes.append("发票云：已保存 %d 家（独立文件 piazzone.bin）。"
+                             % len(piazzone.get("orgs") or {}))
+            elif piazzone_store.delete():
+                notes.append("发票云：配置已清空。")
+        except Exception as exc:  # noqa: BLE001
+            return False, "金蝶部分已保存，但发票云保存失败：%s" % exc, notes
+    else:
+        cur = load_piazzone()
+        if cur:
+            notes.append("发票云：%d 家未改动。" % len(cur.get("orgs") or {}))
+
     if LEGACY_CONFIG.is_file():
         try:
             LEGACY_CONFIG.unlink()
@@ -743,10 +794,7 @@ def _run_gui_inner(change_key: bool, tk, messagebox, ttk) -> int:
         if str(pre.get("acctid") or "").strip():
             payload["acctid"] = str(pre["acctid"]).strip()
         pz = _piazzone_payload(pz_orgs_now, pz_active_now)
-        if pz:
-            payload["piazzone"] = pz
-
-        ok, err, notes = _save_payload(payload)
+        ok, err, notes = _save_payload(payload, piazzone=pz)
         if not ok:
             messagebox.showerror("保存失败", err, parent=root)
             return
@@ -888,8 +936,7 @@ def _console_wizard(change_key: bool = False) -> int:
     """
     pre = collect_prefill()
     legacy_has_secret = bool(str(_read_legacy_config().get("password") or "").strip())
-    saved = credstore.load() or {}
-    pz_orgs, pz_active = _piazzone_state(saved.get("piazzone") or pre.get("piazzone"))
+    pz_orgs, pz_active = _piazzone_state(load_piazzone())
 
     steps = [
         ["base_url", "服务器地址", str(pre.get("base_url") or ""), False],
@@ -1001,10 +1048,8 @@ def _console_wizard(change_key: bool = False) -> int:
         payload["acctid"] = str(pre["acctid"]).strip()
 
     pz = _ask_piazzone(pz_orgs, pz_active)
-    if pz:
-        payload["piazzone"] = pz
 
-    ok, err, notes = _save_payload(payload)
+    ok, err, notes = _save_payload(payload, piazzone=pz)
     if not ok:
         print("\n❌ 保存失败：%s" % err)
         return EXIT_SAVE_FAILED
@@ -1072,26 +1117,29 @@ def _ask_piazzone(saved_orgs: dict, active: str, force: bool = False) -> dict:
 
 
 def _piazzone_only_wizard() -> int:
-    """只维护发票云（原生表单里勾了「同时维护发票云」后由它接手）。"""
+    """只维护发票云（不碰 `credentials.bin` 里的金蝶连接凭据）。"""
     data = credstore.load() or {}
     if not (data.get("username") and data.get("password")):
-        print("还没配置金蝶凭据 —— 请先跑一次完整的凭据录入。")
+        print("还没有金蝶连接凭据 —— 请先用**导出技能**（kingdee-data-exporter）的凭据向导配置一次。")
+        print("只装了报销助手的话，可以用：python helpers/setup_credentials.py --full")
         return EXIT_UNSUPPORTED
-    orgs, active = _piazzone_state(data.get("piazzone"))
+    orgs, active = _piazzone_state(load_piazzone())
     print("=" * 64)
     print("金蝶云星空 · 发票云维护（文字向导）")
-    print("只改这一组，金蝶连接的凭据原样保留。")
+    print("只改这一组（独立文件 piazzone.bin），金蝶连接的凭据原样保留。")
     print("=" * 64)
     pz = _ask_piazzone(orgs, active, force=True)
-    if pz:
-        data["piazzone"] = pz
-    ok, err, notes = _save_payload(data)
-    if not ok:
-        print("\n❌ 保存失败：%s" % err)
+    try:
+        if pz:
+            piazzone_store.save(pz)
+        elif piazzone_store.delete():
+            print("✓ 发票云配置已清空。")
+    except Exception as exc:  # noqa: BLE001
+        print("\n❌ 保存失败：%s" % exc)
         return EXIT_SAVE_FAILED
-    print("")
-    for line in notes:
-        print("✓ " + line)
+    if pz:
+        print("\n✓ 发票云：已保存 %d 家（%s）"
+              % (len(pz.get("orgs") or {}), piazzone_store.PZ_PATH))
     try:
         input("\n按回车关闭这个窗口…")
     except (EOFError, KeyboardInterrupt):
@@ -1120,8 +1168,7 @@ def _native_form(change_key: bool) -> int:
     try:
         pre = collect_prefill()
         legacy_has_secret = bool(str(_read_legacy_config().get("password") or "").strip())
-        saved = credstore.load() or {}
-        orgs, active = _piazzone_state(saved.get("piazzone"))
+        orgs, active = _piazzone_state(load_piazzone())
         try:
             got = wf.run_form(change_key=change_key,
                               prefill={"base_url": pre.get("base_url") or "",
@@ -1140,10 +1187,7 @@ def _native_form(change_key: bool) -> int:
         if str(pre.get("acctid") or "").strip():
             payload["acctid"] = str(pre["acctid"]).strip()
         pz = _piazzone_payload(orgs, active)          # 没勾「维护发票云」就原样保留
-        if pz:
-            payload["piazzone"] = pz
-
-        ok, err, notes = _save_payload(payload)
+        ok, err, notes = _save_payload(payload, piazzone=(pz or _UNSET))
         if not ok:
             wf.message("保存失败：\n%s" % err, "保存失败", warning=True)
             return EXIT_SAVE_FAILED
@@ -1177,7 +1221,7 @@ def _relaunch(prefix: list[str], flag: str, change_key: bool) -> int:
     script = str(Path(__file__).resolve())
     cmd = list(prefix) + [script, flag] + (["--change-key"] if change_key else [])
     flags = 0
-    if flag == "--console-child":
+    if flag in ("--console-child", "--piazzone-child"):
         # 关键：独立控制台 → 子进程的 stdin/stdout 都不接 agent 的管道
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
     try:
@@ -1192,11 +1236,15 @@ def _relaunch(prefix: list[str], flag: str, change_key: bool) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="金蝶凭据配置向导（弹窗、加密保存、不落明文）")
+    ap = argparse.ArgumentParser(
+        description="金蝶凭据向导：发票云是本技能专有部分；金蝶连接凭据建议由导出技能统一配置")
     ap.add_argument("--check", action="store_true", help="只打印状态，不开窗")
-    ap.add_argument("--delete", action="store_true", help="删除已保存的加密凭据")
+    ap.add_argument("--delete", action="store_true", help="删除已保存的加密凭据（含发票云）")
     ap.add_argument("--change-key", dest="change_key", action="store_true",
                     help="「修改密钥」模式开窗")
+    ap.add_argument("--piazzone", action="store_true", help="只维护发票云那一组")
+    ap.add_argument("--full", action="store_true",
+                    help="连金蝶连接凭据一起录（只装了报销助手时用；装了导出技能就别用）")
     ap.add_argument("--console", action="store_true", help="强制文字向导（排障用）")
     ap.add_argument("--native", action="store_true", help="强制原生表单（排障用）")
     ap.add_argument("--ui-child", dest="ui_child", action="store_true", help=argparse.SUPPRESS)
@@ -1206,15 +1254,30 @@ def main() -> int:
                     help=argparse.SUPPRESS)
     a = ap.parse_args()
 
+    # 旧版本把发票云塞在 credentials.bin 里 —— 一次性迁到独立文件（幂等，不迁就一直兼容读）
+    if credstore.available():
+        try:
+            m = piazzone_store.migrate_from_credstore(quiet=True)  # 提示由这里统一打，别重复
+            if m.get("migrated") and "已迁移" in str(m.get("reason") or ""):
+                print("（发票云凭据已迁到独立文件 piazzone.bin，旧文件已备份为 credentials.bin.bak-*）")
+        except Exception:  # noqa: BLE001
+            pass
+
     if a.delete:
-        print("已删除" if credstore.delete() else "（没有已保存的加密凭据）")
+        kd = credstore.delete()
+        pz = piazzone_store.delete()
+        print("已删除加密凭据" if (kd or pz) else "（没有已保存的加密凭据）")
+        if pz:
+            print("（发票云凭据 piazzone.bin 已删除）")
         return EXIT_OK
 
     if a.check:
         data = credstore.load() or {}
-        orgs, active = _piazzone_state(data.get("piazzone"))
-        print("加密凭据文件 :", credstore.STORE_PATH, "存在" if credstore.exists() else "不存在")
+        orgs, active = _piazzone_state(load_piazzone())
+        print("金蝶连接凭据 :", credstore.STORE_PATH, "存在" if credstore.exists() else "不存在")
         print("加密凭据内容 :", credstore.describe())
+        print("发票云凭据   :", piazzone_store.PZ_PATH,
+              "存在" if piazzone_store.exists() else "不存在")
         try:
             import win32_form as _wf
             native_ok = _wf.available()
@@ -1223,6 +1286,7 @@ def main() -> int:
         print("录入界面     : tkinter=%s ｜ 原生表单=%s ｜ 文字向导=是"
               % ("有" if _has_tkinter() else "无（会自动另找解释器）",
                  "可用" if native_ok else "不可用"))
+        print("凭据归属     : 金蝶连接 → 导出技能；发票云 → 本技能")
         if orgs:
             print("发票云组织   : %d 家（active=%s）" % (len(orgs), active or "-"))
             for _n, _v in orgs.items():
@@ -1254,10 +1318,30 @@ def main() -> int:
         return EXIT_NEED_FALLBACK if code is None else code
     if a.console_child or a.console:
         return _console_wizard(change_key=a.change_key)
-    if a.piazzone_child:
+    if a.piazzone or a.piazzone_child:
         return _piazzone_only_wizard()
     if a.native:
         return _native_form(a.change_key)
+
+    # ── 这次录什么：金蝶连接归导出技能，发票云归本技能（一份凭据只有一个写入者）──
+    kd = credstore.load() or {}
+    has_kd = bool(kd.get("username") and kd.get("password"))
+    has_exp = exporter_present()
+    if has_kd and not a.full:
+        if a.change_key:
+            if has_exp:
+                print("金蝶密码由**导出技能**统一管理，改密码请用它：")
+                print("    python <导出技能目录>/setup_credentials.py --change-key")
+                print("（确实要在这里改，加 --full）")
+                return EXIT_UNSUPPORTED
+            # 没装导出技能 → 只能在这里改
+        else:
+            print("金蝶连接凭据已存在（由导出技能统一管理），这次只维护发票云。")
+            return _relaunch([sys.executable], "--piazzone-child", False)
+    if not has_kd and has_exp:
+        print("还没有金蝶连接凭据。建议先用**导出技能**配一次（全系列共用同一份）：")
+        print("    python <导出技能目录>/setup_credentials.py")
+        print("下面也可以一并录入（只装了报销助手时用得上）。")
 
     # L0：当前解释器就能弹窗（tkinter 版界面最好，还带发票云多组织卡片）
     if _has_tkinter():
