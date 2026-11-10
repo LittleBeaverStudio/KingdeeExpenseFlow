@@ -217,6 +217,85 @@ ATTACHMENT_ONLY_ORGS = ()          # 例：("105",) —— 默认空，即不允
 RECV_ENTITY = {"save_key": "FRecInvInfo", "view_name": "RecInvInfo"}
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 🔒 建单方式决策（v2.3.6）：有申请单→下推；无申请单→看策略(requires_push)决定可新建还是必须先建申请单
+# ────────────────────────────────────────────────────────────────────────────
+# 默认 False = 允许「手工新建报销单（Save，ISDRAW=0）」；这与"有的用户确实可以新建"一致。
+# 若某组织某单据类型被金蝶配置了「必须下推生成 / 不允许直接新增」，
+# 由维护者把该 (组织, 单据类型) 显式登记进 create_policy.json 的 requires_push=true，
+# 助手遇到无申请单的建单请求会提示「先建申请单再下推」，而不是造出审核必退的废单。
+# create_policy.json 路径：~/.workbuddy/kingdee/create_policy.json（不进 git / 不进发布件）。
+CREATE_POLICY_PATH = os.path.join(os.path.expanduser("~"), ".workbuddy", "kingdee", "create_policy.json")
+
+
+def _load_create_policy():
+    """读 ~/.workbuddy/kingdee/create_policy.json；文件不存在/损坏返回默认空策略。"""
+    if not os.path.isfile(CREATE_POLICY_PATH):
+        return {"default_requires_push": False, "rules": []}
+    try:
+        with open(CREATE_POLICY_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {"default_requires_push": False, "rules": []}
+    if not isinstance(data, dict):
+        return {"default_requires_push": False, "rules": []}
+    data.setdefault("default_requires_push", False)
+    data.setdefault("rules", [])
+    return data
+
+
+def create_requires_push(org_no, billtype_fnumber):
+    """该 (组织, 单据类型) 是否「必须下推生成、不允许手工新建」。
+
+    查表优先级：精确 (org,billtype) > (org,ALL) > (*,billtype) > (*,ALL) > default。
+    命中任意一条 requires_push 即返回 True。
+    ⚠️ 无法运行时自动探测：该规则在**审核**环节才触发，不在保存校验里，故用数据开关兜底。
+    """
+    org = str(org_no or "").strip()
+    bt = str(billtype_fnumber or "").strip()
+    policy = _load_create_policy()
+    rules = policy.get("rules", [])
+    for r in rules:
+        if str(r.get("org") or "").strip() == org and str(r.get("billtype") or "").strip() == bt:
+            return bool(r.get("requires_push"))
+    for r in rules:
+        if str(r.get("org") or "").strip() == org and str(r.get("billtype") or "").strip().upper() == "ALL":
+            return bool(r.get("requires_push"))
+    for r in rules:
+        if str(r.get("org") or "").strip() in ("*", "") and str(r.get("billtype") or "").strip() == bt:
+            return bool(r.get("requires_push"))
+    for r in rules:
+        if str(r.get("org") or "").strip() in ("*", "") and str(r.get("billtype") or "").strip().upper() == "ALL":
+            return bool(r.get("requires_push"))
+    return bool(policy.get("default_requires_push", False))
+
+
+def decide_create_mode(org_no, billtype_fnumber, has_application=False):
+    """返回建单方式决策：'push' / 'save' / 'blocked_need_application'。
+
+    - 有申请单 → 一律 'push'（最合规，ISDRAW=1，所有组织都过）
+    - 无申请单且 requires_push → 'blocked_need_application'
+    - 无申请单且允许 → 'save'
+    """
+    if has_application:
+        return "push"
+    if create_requires_push(org_no, billtype_fnumber):
+        return "blocked_need_application"
+    return "save"
+
+
+def diagnose_submit_error(msg):
+    """识别「审核/提交被『必须下推生成 / 不允许直接新增』类规则拦下」的错误，返回自救指引（str）或 None。"""
+    text = str(msg or "")
+    if any(k in text for k in ("已下推生成", "不允许直接新增", "必须下推", "不允许手工新建")):
+        return (
+            "🔧 该报销单是「手工新建（ISDRAW=0）」，但本组织要求「必须下推生成」。\n"
+            "   → 自救路径：UI 驳回/撤回这张单 → 回到 Z/A/D 状态 → WebAPI 删除 → "
+            "从对应的费用/出差申请单重新【下推】生成报销单（ISDRAW=1，规则通过）。\n"
+            "   → 注：仅填源单号字段不会把 ISDRAW 置 1，必须真下推。")
+    return None
+
+
 def _exporter_candidates():
     """可能存放 kingdee-data-exporter 的目录（用于复用其 config.py）。"""
     here = os.path.dirname(os.path.abspath(__file__))            # .../kingdee-expense-flow/helpers
@@ -1469,8 +1548,11 @@ def cmd_submit(kd, a):
               "把报销金额调到发票金额）后重试。")
         return 3
     else:
-        print(f"  ❌ 提交失败 MsgCode={st.get('MsgCode')} "
-              f"{json.dumps(st.get('Errors', [])[:2], ensure_ascii=False)[:400]}")
+        err_blob = json.dumps(st.get("Errors", []), ensure_ascii=False)
+        print(f"  ❌ 提交失败 MsgCode={st.get('MsgCode')} {err_blob[:400]}")
+        diag = diagnose_submit_error(err_blob)
+        if diag:
+            print("  " + diag)
         return 1
     time.sleep(2)
     o = kd.view(formid, a.fid)
@@ -1645,6 +1727,28 @@ def cmd_create_recvin(kd, a):
     return 0
 
 
+def cmd_route_detect(kd, a):
+    """建单方式决策：有申请单→下推；无申请单看策略决定可新建还是必须先建申请单。"""
+    org = str(a.org or "").strip()
+    bt = str(a.billtype or "").strip()
+    mode = decide_create_mode(org, bt, has_application=a.has_application)
+    req = create_requires_push(org, bt)
+    print("建单方式决策 route-detect")
+    print("  组织          : %s" % (org or "(未提供→按登记策略/默认)"))
+    print("  单据类型      : %s" % (bt or "(未提供)"))
+    print("  有申请单?     : %s" % ("是 → 一律下推" if a.has_application else "否"))
+    print("  策略 requires_push = %s" % req)
+    print("  ⇒ 决策        : %s" % mode)
+    if mode == "push":
+        print("     → 有申请单：直接【下推】生成报销单（ISDRAW=1，所有组织合规）。")
+    elif mode == "save":
+        print("     → 无申请单且该组织允许新建：可用 Save 手工新建报销单。")
+    elif mode == "blocked_need_application":
+        print("     → 无申请单且该组织【不允许直接新建】：请先建费用/出差申请单，再【下推】生成报销单。")
+        print("       助手可代建申请单后再下推；不要走 Save 新建，否则审核必退。")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="报销单「收票信息」写入（纯金蝶 WebAPI）")
     p.add_argument("--travel", action="store_true", help="操作差旅费报销单 ER_ExpReimbursement_Travel")
@@ -1731,6 +1835,15 @@ def main():
     s.add_argument("--bill-no", help="报销单编号（可选）")
     s.add_argument("--link", metavar="报销单FID", help="建好后直接挂到该报销单的收票信息")
     s.set_defaults(fn=cmd_create_recvin)
+
+    s = sub.add_parser("route-detect",
+                       help="建单方式决策：有申请单→下推；无申请单看策略(requires_push)决定可新建还是必须先建申请单")
+    s.add_argument("--org", default="", help="报销单组织编码，如 101")
+    s.add_argument("--billtype", default="",
+                   help="单据类型 FBillTypeID.FNumber，如 CLFBX002_SYS / FYBXD001_SYS")
+    s.add_argument("--has-application", action="store_true",
+                   help="该用户/费用已有对应申请单（下推来源）")
+    s.set_defaults(fn=cmd_route_detect)
 
     # 让 --travel 写在子命令「前」或「后」都能生效
     # （default=SUPPRESS：子命令未显式给出时不覆盖顶层已解析的值）

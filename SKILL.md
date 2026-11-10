@@ -2,13 +2,13 @@
 name: kingdee-expense-flow
 slug: kingdee-expense-flow
 displayName: 金蝶云星空报销助手
-version: 2.3.5
+version: 2.3.6
 summary: 小河狸工作室出品：金蝶云星空费用/差旅报销全流程提交，员工不登录金蝶也能报销。
-description: 小河狸工作室出品。金蝶云星空「费用/差旅报销全流程」提交 Skill：员工无需登录金蝶，在对话里把发票交上来，agent 用纯 WebAPI 完成「费用申请单 → 下推报销单 → 挂收票信息／传附件 → 提交审批」，差旅线结构同构。内置发票清晰度与抬头校验、收票信息 vs 附件分流（行程单双算预警）、跨组织挂票硬拦截、收票池账号可见性隔离、四条提交硬闸门（收票 0 行 / 无发票云流水号 / 跨组织 / 发票合计 < 报销额，无绕过参数）、按发票金额调低报销额（fit，唯一合规出路）、服务端上传发票并建收票单（员工零操作）、单一登录入口、提交前体检。适用于金蝶云星空（K3 Cloud）的费用报销、差旅报销、员工报销、发票挂单、提交审批场景。
+description: 小河狸工作室出品。金蝶云星空「费用/差旅报销全流程」提交 Skill：员工无需登录金蝶，在对话里把发票交上来，agent 用纯 WebAPI 完成「费用申请单 → 下推报销单 → 挂收票信息／传附件 → 提交审批」，差旅线结构同构。内置发票清晰度与抬头校验、收票信息 vs 附件分流（行程单双算预警）、跨组织挂票硬拦截、收票池账号可见性隔离、四条提交硬闸门（收票 0 行 / 无发票云流水号 / 跨组织 / 发票合计 < 报销额，无绕过参数）、按发票金额调低报销额（fit，唯一合规出路）、服务端上传发票并建收票单（员工零操作）、单一登录入口、提交前体检。适用于金蝶云星空（K3 Cloud）的费用报销、差旅报销、员工报销、发票挂单、提交审批场景；内置建单方式决策（有申请单→下推，无申请单读策略决定可新建或必须先建申请单），避免手工新建被「必须下推生成」规则卡在审核环节。
 license: 小河狸非转售许可 1.0（企业内部使用免费，转售收费需授权）
 tags: [金蝶云星空, 费用报销, 差旅报销, 财务自动化, WebAPI, 发票]
 metadata:
-  version: 2.3.5
+  version: 2.3.6
   author: 小河狸工作室
   tags:
     - 金蝶云星空
@@ -233,6 +233,49 @@ python data_exporter.py --list-datacenters
 - `FEInvoiceEntity` 是另一个发票子表，**不是**收票信息，历史单多为空 —— 不要往这里填发票绕过校验。
 
 ## 4. 标准流程（费用申请单 → 报销单）
+
+### 4.0 建单方式决策：先判断走「下推」还是「新建」（v2.3.6 新增）🔒
+
+报销单有两条合法建单路径，规则不同：
+
+| 路径 | 怎么建 | ISDRAW | 适用 |
+|---|---|---|---|
+| **下推** | 从费用/出差申请单 `Push` 生成 | `=1`（系统认定"由下推生成"） | **所有组织都合规** |
+| **新建** | `Save` 手工建单 | `=0` | 仅当该组织**允许**手工新建时合规 |
+
+⚠️ **若某组织配置了「必须下推生成 / 不允许直接新增」，用 `Save` 新建的单在「审核」环节才会爆**
+（报错"报销单号已下推生成，无法直接新增"），提交时看不出问题——这正是 GLRX2020000582 那类事故的根因。
+
+**决策顺序（严格遵守，避免造出审核必退的废单）：**
+
+1. **这笔费用有对应申请单吗？** → 有 → **一律走【下推】`Push`**。最稳，所有组织都过，优先这么做。
+2. **没有申请单** → 跑 `route-detect` 看该 (组织, 单据类型) 的策略：
+   ```bash
+   python helpers/recvin_link.py route-detect --org 101 --billtype CLFBX002_SYS
+   ```
+   - `requires_push=true` → **不要** `Save` 新建；提示用户「本组织不允许手工新建报销单，请先建费用/出差申请单」，
+     助手可代建申请单后再【下推】。
+   - `requires_push=false` → 可 `Save` 新建。
+3. **策略怎么登记**（运行时无法自动探测，该规则在审核才触发、不在保存校验里）：
+   文件 `~/.workbuddy/kingdee/create_policy.json`（不进 git / 不进发布件）：
+   ```json
+   {
+     "default_requires_push": false,
+     "rules": [
+       {"org": "101", "billtype": "CLFBX002_SYS", "requires_push": true},
+       {"org": "101", "billtype": "FYBXD001_SYS", "requires_push": true}
+     ]
+   }
+   ```
+   - 默认 `false`（允许新建），与"有的用户确实可以新建"一致；
+   - 把"必须下推"的组织/单据类型显式登记为 `requires_push=true`。
+   - 查表优先级：精确 `(org,billtype)` > `(org,ALL)` > `(*,billtype)` > `(*,ALL)` > `default`。
+
+⚠️ **自助救单**（已造出 ISDRAW=0 的错单、审核报"已下推生成/不允许新增"时）：
+UI 驳回/撤回这张单 → 回到 Z/A/D → WebAPI `Delete` 删掉 → 从对应申请单重新【下推】生成（`ISDRAW=1`，规则通过）。
+**仅填源单号字段不会把 `ISDRAW` 置 1，必须真下推。**
+
+
 
 1. **提交费用申请单**：`Save ER_ExpenseRequest`（模板见 `references/field_cookbook.md`，含项目必填等坑）。
    默认只到暂存，确认后再 Submit。
@@ -496,7 +539,7 @@ org 105 这类**只用附件**的组织，跟随其既有做法走附件即可 �
 | `helpers/piazzone_store.py` ★ | 发票云凭据的**独立**加密存储（`piazzone.bin`）；含旧数据迁移：把 `credentials.bin` 里遗留的 `piazzone` 段搬过来（先备份） |
 | `helpers/win32_form.py` ★ | 原生 Windows 表单（纯 `ctypes` 调 user32/gdi32，无任何依赖）：输入框 / 密码框（`ES_PASSWORD` + 显示密码）/ 复选框 / 按钮；高 DPI 自适应、输入法组词时不吃回车 |
 | `helpers/credstore.py` ★ | DPAPI 加密凭据存储（纯标准库 `ctypes`）；`describe()` 只回报字段名，永不回显值 |
-| `helpers/recvin_link.py` ★ | 核心：收票信息写入与提交。`find` / `list` / `resolve` / `link` / `clear` / `precheck` / `set-contact` / `submit` / `verify` / `upload` / `create-recvin` / `strict`；内置防抢关联、编辑锁重试、提交闸门 |
+| `helpers/recvin_link.py` ★ | 核心：收票信息写入与提交、建单方式决策。`find` / `list` / `resolve` / `link` / `clear` / `precheck` / `set-contact` / `submit` / `verify` / `upload` / `create-recvin` / `strict` / `route-detect`（建单决策：有申请单→下推；无申请单读策略决定可新建或必须先建申请单）；内置防抢关联、编辑锁重试、提交闸门、审核失败自救指引 |
 | `helpers/expense_edit.py` ★ | 明细 ↔ 发票对齐与附件。`attach` / `set-detail` / `linkage` / `fit` / `download` / `check` |
 | `helpers/perm_probe.py` | **只读**权限可见性实测器：`--pool` / `--by-invoice` / `--by-bill` / `--bills` / `--fields` / `--json` |
 | `helpers/invoice_classifier.py` | 发票 vs 行程单分类、字段提取、双算预警 |

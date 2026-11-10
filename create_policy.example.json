@@ -1,0 +1,8 @@
+{
+  "default_requires_push": false,
+  "rules": [
+    {"org": "101", "billtype": "CLFBX002_SYS", "requires_push": true},
+    {"org": "101", "billtype": "FYBXD001_SYS", "requires_push": true},
+    {"org": "105", "billtype": "ALL", "requires_push": false}
+  ]
+}

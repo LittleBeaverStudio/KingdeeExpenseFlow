@@ -17,6 +17,7 @@
 | v2.1.0 | 新增 `upload` / `create-recvin`：agent 服务端上传发票并建收票单，替代界面「发票导入单据」，员工零操作 |
 | **v2.1.1** | 多收票组织自动路由 + 向导大幅简化（见下节） |
 | v2.3.0 | 发票云多组织自动路由定稿；凭据向导重做（DPAPI、明文强制迁移、一家一卡片框、保存后自动关闭） |
+| **v2.3.6** | 新增「建单方式决策」：`route-detect` 子命令 + `decide_create_mode` / `create_requires_push` / `diagnose_submit_error`。原则——**有申请单一律下推**；无申请单读 per-(org,billtype) 策略开关 `requires_push` 决定可新建还是必须先建申请单。背景：公有云无法运行时自动探测「必须下推生成」规则（它在**审核**环节才触发、不在保存校验里），故用数据开关 + 安全默认兜底，避免造出审核必退的废单（GLRX2020000582 那类事故）。提交失败若命中「已下推生成/不允许直接新增」自动给自愈指引（UI 驳回→删→从申请单下推）。策略文件 `~/.workbuddy/kingdee/create_policy.json`（不进 git），模板见 `create_policy.example.json`。 |
 
 ### v2.1.1 向导改了什么（起因与取舍）
 
